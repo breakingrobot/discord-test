@@ -1,50 +1,122 @@
 mod api;
+mod ui;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, Focusable,
-    KeyDownEvent, SharedString, Window, WindowBounds, WindowOptions,
+    prelude::*, px, size, App, Application, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
+    KeyDownEvent, Render, ScrollHandle, Window, WindowBounds, WindowOptions,
 };
 
-use api::{Channel, Guild, Message};
+use api::{Channel, Guild, Message, User};
 
-/// Pseudo guild id for the direct-messages entry.
-const DMS: &str = "@me";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-struct DiscordApp {
+pub struct DiscordApp {
     focus: FocusHandle,
+    scroll: ScrollHandle,
     /// User or bot token. Empty until login succeeds.
     token: String,
+    me: Option<User>,
     logged_in: bool,
     input: String,
+    /// Caret position in `input`, counted in chars.
+    cursor: usize,
     status: String,
     guilds: Vec<Guild>,
+    dms: Vec<Channel>,
     channels: Vec<Channel>,
     messages: Vec<Message>,
+    /// `None` is the Home / direct-messages view.
     guild: Option<String>,
     channel: Option<Channel>,
+    collapsed: HashSet<String>,
+    last_msg_id: Option<String>,
 }
 
 impl DiscordApp {
     fn new(cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             focus: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
             token: String::new(),
+            me: None,
             logged_in: false,
-            input: std::env::var("DISCORD_TOKEN").unwrap_or_default(),
-            status: "Paste your Discord token and press Enter (or set DISCORD_TOKEN).".into(),
+            input: String::new(),
+            cursor: 0,
+            status: String::new(),
             guilds: vec![],
+            dms: vec![],
             channels: vec![],
             messages: vec![],
             guild: None,
             channel: None,
+            collapsed: HashSet::new(),
+            last_msg_id: None,
         };
-        if !this.input.is_empty() {
-            this.submit(cx);
+        if let Ok(token) = std::env::var("DISCORD_TOKEN") {
+            if !token.trim().is_empty() {
+                this.login(token.trim().to_string(), cx);
+            }
         }
         this
+    }
+
+    // ---- input editing -------------------------------------------------
+
+    fn byte_idx(&self) -> usize {
+        self.input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+
+    fn insert(&mut self, s: &str) {
+        let at = self.byte_idx();
+        self.input.insert_str(at, s);
+        self.cursor += s.chars().count();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let len = self.input.chars().count();
+        let cmd = ks.modifiers.control || ks.modifiers.platform;
+        match ks.key.as_str() {
+            "enter" => return self.submit(cx),
+            "backspace" if self.cursor > 0 => {
+                self.cursor -= 1;
+                let at = self.byte_idx();
+                self.input.remove(at);
+            }
+            "delete" if self.cursor < len => {
+                let at = self.byte_idx();
+                self.input.remove(at);
+            }
+            "left" => self.cursor = self.cursor.saturating_sub(1),
+            "right" => self.cursor = (self.cursor + 1).min(len),
+            "home" => self.cursor = 0,
+            "end" => self.cursor = len,
+            "v" if cmd => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    self.insert(&text.replace(['\r', '\n'], " "));
+                }
+            }
+            "a" if cmd => self.cursor = len,
+            "c" if cmd => cx.write_to_clipboard(ClipboardItem::new_string(self.input.clone())),
+            _ if cmd => return,
+            _ => match &ks.key_char {
+                Some(ch) => self.insert(ch),
+                None => return,
+            },
+        }
+        cx.notify();
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -55,7 +127,7 @@ impl DiscordApp {
         if !self.logged_in {
             self.login(text, cx);
         } else if let Some(channel) = self.channel.clone() {
-            self.input.clear();
+            self.clear_input();
             let token = self.token.clone();
             cx.spawn(async move |this, cx| {
                 let res = cx
@@ -63,8 +135,10 @@ impl DiscordApp {
                     .await;
                 this.update(cx, |this, cx| {
                     if let Err(e) = res {
-                        this.status = format!("Send failed: {e}");
+                        this.status = format!("Échec de l'envoi : {e}");
                     }
+                    // Always jump to our own message.
+                    this.last_msg_id = None;
                     this.refresh_messages(cx);
                 })
                 .ok();
@@ -74,24 +148,62 @@ impl DiscordApp {
         cx.notify();
     }
 
+    // ---- data loading --------------------------------------------------
+
     fn login(&mut self, token: String, cx: &mut Context<Self>) {
-        self.status = "Logging in…".into();
+        self.status = "Connexion…".into();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let t = token.clone();
-            let res = cx.background_spawn(async move { api::guilds(&t) }).await;
+            let res = cx
+                .background_spawn(async move {
+                    Ok::<_, String>((
+                        api::me(&t)?,
+                        api::guilds(&t)?,
+                        api::dms(&t).unwrap_or_default(),
+                    ))
+                })
+                .await;
             this.update(cx, |this, cx| {
                 match res {
-                    Ok(guilds) => {
+                    Ok((me, guilds, dms)) => {
                         this.token = token;
-                        this.logged_in = true;
+                        this.me = Some(me);
                         this.guilds = guilds;
-                        this.input.clear();
-                        this.status = "Pick a server.".into();
+                        this.dms = dms;
+                        this.logged_in = true;
+                        this.status.clear();
+                        this.clear_input();
                         this.start_polling(cx);
                     }
-                    Err(e) => this.status = format!("Login failed: {e}"),
+                    Err(e) => this.status = format!("Connexion impossible : {e}"),
                 }
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_home(&mut self, cx: &mut Context<Self>) {
+        self.guild = None;
+        self.channel = None;
+        self.channels.clear();
+        self.messages.clear();
+        self.last_msg_id = None;
+        self.refresh_dms(cx);
+        cx.notify();
+    }
+
+    fn refresh_dms(&mut self, cx: &mut Context<Self>) {
+        let token = self.token.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_spawn(async move { api::dms(&token) }).await;
+            this.update(cx, |this, cx| {
+                if let Ok(dms) = res {
+                    this.dms = dms;
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -103,21 +215,25 @@ impl DiscordApp {
         self.channels.clear();
         self.channel = None;
         self.messages.clear();
+        self.last_msg_id = None;
         let token = self.token.clone();
         cx.spawn(async move |this, cx| {
+            let gid = id.clone();
             let res = cx
-                .background_spawn(async move {
-                    if id == DMS {
-                        api::dms(&token)
-                    } else {
-                        api::channels(&token, &id)
-                    }
-                })
+                .background_spawn(async move { api::channels(&token, &gid) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.guild.as_deref() != Some(&id) {
+                    return;
+                }
                 match res {
-                    Ok(c) => this.channels = c,
-                    Err(e) => this.status = format!("Channels failed: {e}"),
+                    Ok(c) => {
+                        this.channels = c;
+                        if let Some(first) = this.channels.iter().find(|c| c.kind != 4).cloned() {
+                            this.select_channel(first, cx);
+                        }
+                    }
+                    Err(e) => this.status = format!("Salons indisponibles : {e}"),
                 }
                 cx.notify();
             })
@@ -130,6 +246,8 @@ impl DiscordApp {
     fn select_channel(&mut self, channel: Channel, cx: &mut Context<Self>) {
         self.channel = Some(channel);
         self.messages.clear();
+        self.last_msg_id = None;
+        self.status.clear();
         self.refresh_messages(cx);
         cx.notify();
     }
@@ -151,10 +269,21 @@ impl DiscordApp {
                 }
                 match res {
                     Ok(m) => {
+                        let newest = m.last().map(|x| x.id.clone());
+                        if newest != this.last_msg_id {
+                            // Follow new messages only if we were already at the bottom.
+                            let off = this.scroll.offset().y;
+                            let at_bottom = this.last_msg_id.is_none()
+                                || off <= -this.scroll.max_offset().height + px(80.);
+                            if at_bottom {
+                                this.scroll.scroll_to_bottom();
+                            }
+                            this.last_msg_id = newest;
+                        }
                         this.messages = m;
                         this.status.clear();
                     }
-                    Err(e) => this.status = format!("Messages failed: {e}"),
+                    Err(e) => this.status = format!("Messages indisponibles : {e}"),
                 }
                 cx.notify();
             })
@@ -163,37 +292,21 @@ impl DiscordApp {
         .detach();
     }
 
-    /// Simple polling instead of the gateway websocket, to keep this minimal.
+    /// Simple polling instead of the gateway websocket, to keep this lightweight.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
-            if this
-                .update(cx, |this, cx| this.refresh_messages(cx))
-                .is_err()
-            {
+            let alive = this.update(cx, |this, cx| {
+                this.refresh_messages(cx);
+                if this.guild.is_none() {
+                    this.refresh_dms(cx);
+                }
+            });
+            if alive.is_err() {
                 break;
             }
         })
         .detach();
-    }
-
-    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        match ks.key.as_str() {
-            "enter" => self.submit(cx),
-            "backspace" => {
-                self.input.pop();
-            }
-            _ => {
-                if ks.modifiers.control || ks.modifiers.platform {
-                    return;
-                }
-                if let Some(ch) = &ks.key_char {
-                    self.input.push_str(ch);
-                }
-            }
-        }
-        cx.notify();
     }
 }
 
@@ -208,149 +321,13 @@ impl Render for DiscordApp {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
-
-        let shown_input: SharedString = if self.logged_in {
-            self.input.clone().into()
-        } else {
-            "•".repeat(self.input.chars().count()).into()
-        };
-        let placeholder = if !self.logged_in {
-            "User or bot token"
-        } else if self.channel.is_some() {
-            "Message"
-        } else {
-            ""
-        };
-
-        let guild_list = div()
-            .id("guilds")
-            .w(px(180.))
-            .h_full()
-            .bg(rgb(0x1e1f22))
-            .overflow_y_scroll()
-            .p_2()
-            .gap_1()
-            .flex()
-            .flex_col()
-            .children(
-                std::iter::once(Guild {
-                    id: DMS.into(),
-                    name: "Direct Messages".into(),
-                })
-                .chain(self.guilds.iter().cloned())
-                .map(|g| {
-                    let id = g.id.clone();
-                    let active = self.guild.as_deref() == Some(&g.id);
-                    div()
-                        .id(SharedString::from(format!("g-{}", g.id)))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(active, |d| d.bg(rgb(0x404249)))
-                        .hover(|d| d.bg(rgb(0x35373c)))
-                        .child(g.name.clone())
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx)),
-                        )
-                }),
-            );
-
-        let channel_list = div()
-            .id("channels")
-            .w(px(200.))
-            .h_full()
-            .bg(rgb(0x2b2d31))
-            .overflow_y_scroll()
-            .p_2()
-            .gap_1()
-            .flex()
-            .flex_col()
-            .children(self.channels.iter().map(|c| {
-                let chan = c.clone();
-                let active = self.channel.as_ref().map(|s| &s.id) == Some(&c.id);
-                div()
-                    .id(SharedString::from(format!("c-{}", c.id)))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(rgb(0x404249)))
-                    .hover(|d| d.bg(rgb(0x35373c)))
-                    .child(format!("# {}", c.name.clone().unwrap_or_default()))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
-                    )
-            }));
-
-        let messages = div()
-            .id("messages")
-            .flex_1()
-            .overflow_y_scroll()
-            .p_3()
-            .gap_2()
-            .flex()
-            .flex_col()
-            .children(self.messages.iter().map(|m| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_color(rgb(0xf2f3f5))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(m.author.username.clone()),
-                    )
-                    .child(div().text_color(rgb(0xdbdee1)).child(m.content.clone()))
-            }));
-
-        let input_box = div()
-            .m_3()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(0x383a40))
-            .child(if self.input.is_empty() {
-                div().text_color(rgb(0x949ba4)).child(placeholder)
-            } else {
-                div().child(shown_input)
-            });
-
-        let main = div()
-            .flex_1()
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x313338))
-            .child(messages)
-            .when(!self.status.is_empty(), |d| {
-                d.child(
-                    div()
-                        .px_3()
-                        .text_sm()
-                        .text_color(rgb(0xf0b232))
-                        .child(self.status.clone()),
-                )
-            })
-            .when(!self.logged_in || self.channel.is_some(), |d| {
-                d.child(input_box)
-            });
-
-        div()
-            .id("root")
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
-            .size_full()
-            .flex()
-            .text_color(rgb(0xdbdee1))
-            .when(self.logged_in, |d| d.child(guild_list).child(channel_list))
-            .child(main)
+        self.root(cx)
     }
 }
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1000.), px(700.)), cx);
+        let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

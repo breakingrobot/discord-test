@@ -3,7 +3,8 @@
 A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 
 - Log in with a **user or bot token** (paste it at the prompt, or set `DISCORD_TOKEN`). User tokens violate Discord's ToS; use at your own risk.
-- Browse servers and text channels, read the last 50 messages, send messages.
+- Discord-style UI (French): server rail, categories, DMs, user panel, grouped messages with day dividers, replies, attachments, caret/paste in the composer.
+- No voice chat, no member list, no embeds/images/emoji/reactions yet.
 - Messages refresh by polling every 3s (REST only; no gateway websocket).
 
 ```
