@@ -11,6 +11,7 @@ use gpui::{
     StrikethroughStyle, StyledImage, StyledText, UnderlineStyle,
 };
 
+use crate::api;
 use crate::api::{Channel, Message, User};
 use crate::gateway::MemberRow;
 use crate::{DiscordApp, Field, LoginMode, Picker, PickerTab, QrState, Side};
@@ -109,6 +110,10 @@ pub mod color {
         pick(0x3b405a, 0xe3e6fc)
     }
 
+    pub fn mention_fg() -> u32 {
+        pick(0xc9cdfb, 0x3c45a5)
+    }
+
     pub fn code_bg() -> u32 {
         pick(0x1e1f22, 0xe3e5e8)
     }
@@ -179,6 +184,47 @@ fn skeleton(
         |d, v| d.opacity(v),
     )
     .into_any_element()
+}
+
+/// Public user flags shown as text badges when the profile endpoint gives none.
+const FLAG_BADGES: [(u64, &str); 10] = [
+    (1 << 0, "Staff Discord"),
+    (1 << 1, "Partenaire"),
+    (1 << 2, "HypeSquad Events"),
+    (1 << 3, "Chasseur de bugs"),
+    (1 << 6, "HypeSquad Bravery"),
+    (1 << 7, "HypeSquad Brilliance"),
+    (1 << 8, "HypeSquad Balance"),
+    (1 << 9, "Soutien précoce"),
+    (1 << 17, "Développeur de bots vérifié"),
+    (1 << 18, "Modérateur certifié"),
+];
+
+fn connection_label(kind: &str) -> String {
+    match kind {
+        "twitter" => "X (Twitter)".into(),
+        "youtube" => "YouTube".into(),
+        "github" => "GitHub".into(),
+        "reddit" => "Reddit".into(),
+        "spotify" => "Spotify".into(),
+        "steam" => "Steam".into(),
+        "twitch" => "Twitch".into(),
+        "xbox" => "Xbox".into(),
+        "playstation" => "PlayStation".into(),
+        "epicgames" => "Epic Games".into(),
+        "battlenet" => "Battle.net".into(),
+        "tiktok" => "TikTok".into(),
+        "instagram" => "Instagram".into(),
+        "facebook" => "Facebook".into(),
+        "bluesky" => "Bluesky".into(),
+        "domain" => "Domaine".into(),
+        other => {
+            let mut c = other.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        }
+    }
 }
 
 fn status_color(status: &str) -> Option<u32> {
@@ -267,6 +313,224 @@ fn resolve_tokens(src: &str, lookup: &dyn Fn(char, &str) -> Option<String>) -> S
     out
 }
 
+// ---- rich message text: mentions, roles, channels, timestamps -----------------
+
+const MARK_OPEN: char = '\u{E000}';
+const MARK_CLOSE: char = '\u{E001}';
+const MARK_SEP: char = '\u{E002}';
+
+const WEEKDAYS: [&str; 7] = [
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+];
+
+fn plural(n: i64, unit: &str) -> String {
+    format!(
+        "{n} {unit}{}",
+        if n > 1 && !unit.ends_with('s') {
+            "s"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Discord `<t:secs:style>` rendering.
+fn fmt_timestamp(secs: i64, style: &str) -> String {
+    let Some(dt) = DateTime::from_timestamp(secs, 0).map(|d| d.with_timezone(&Local)) else {
+        return "date invalide".into();
+    };
+    let date = format!(
+        "{} {} {}",
+        dt.day(),
+        MONTHS[dt.month0() as usize],
+        dt.year()
+    );
+    let hm = hhmm(&dt);
+    match style {
+        "t" => hm,
+        "T" => format!("{hm}:{:02}", dt.second()),
+        "d" => format!("{:02}/{:02}/{}", dt.day(), dt.month(), dt.year()),
+        "D" => date,
+        "F" => format!(
+            "{} {date} {hm}",
+            WEEKDAYS[dt.weekday().num_days_from_monday() as usize]
+        ),
+        "R" => {
+            let diff = Local::now().timestamp() - secs;
+            let (n, future) = (diff.abs(), diff < 0);
+            let text = if n < 60 {
+                plural(n, "seconde")
+            } else if n < 3600 {
+                plural(n / 60, "minute")
+            } else if n < 86_400 {
+                plural(n / 3600, "heure")
+            } else if n < 86_400 * 30 {
+                plural(n / 86_400, "jour")
+            } else if n < 86_400 * 365 {
+                format!("{} mois", n / (86_400 * 30))
+            } else {
+                plural(n / (86_400 * 365), "an")
+            };
+            if future {
+                format!("dans {text}")
+            } else {
+                format!("il y a {text}")
+            }
+        }
+        _ => format!("{date} {hm}"),
+    }
+}
+
+fn fmt_date_ms(ms: u64) -> String {
+    match DateTime::from_timestamp_millis(ms as i64).map(|d| d.with_timezone(&Local)) {
+        Some(d) => format!("{} {} {}", d.day(), MONTHS[d.month0() as usize], d.year()),
+        None => String::new(),
+    }
+}
+
+fn fmt_date_iso(ts: &str) -> String {
+    parse_time(ts)
+        .map(|d| format!("{} {} {}", d.day(), MONTHS[d.month0() as usize], d.year()))
+        .unwrap_or_default()
+}
+
+/// Like [`resolve_tokens`] but wraps mentions in private-use markers so they can be
+/// styled and made clickable after Markdown has run.
+/// Marker layout: OPEN kind id SEP label CLOSE.
+fn resolve_rich(src: &str, lookup: &dyn Fn(char, &str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let wrap = |kind: char, id: &str, label: String| {
+        format!("{MARK_OPEN}{kind}{id}{MARK_SEP}{label}{MARK_CLOSE}")
+    };
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find('>') else {
+            out.push_str(tail);
+            return out;
+        };
+        let inner = &tail[1..end];
+        let replaced = if let Some(id) = inner.strip_prefix("@&") {
+            Some(wrap(
+                'r',
+                id,
+                lookup('r', id).unwrap_or_else(|| "@rôle".into()),
+            ))
+        } else if let Some(id) = inner.strip_prefix("@!").or_else(|| inner.strip_prefix('@')) {
+            Some(wrap(
+                'u',
+                id,
+                lookup('u', id).unwrap_or_else(|| "@utilisateur".into()),
+            ))
+        } else if let Some(id) = inner.strip_prefix('#') {
+            Some(wrap(
+                'c',
+                id,
+                lookup('c', id).unwrap_or_else(|| "#salon".into()),
+            ))
+        } else if let Some(t) = inner.strip_prefix("t:") {
+            lookup('t', t).map(|label| wrap('t', t, label))
+        } else {
+            let e = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
+            e.and_then(|e| e.split(':').next())
+                .map(|n| format!(":{n}:"))
+        };
+        match replaced {
+            Some(r) => out.push_str(&r),
+            None => out.push_str(&tail[..=end]),
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Clone)]
+pub enum Action {
+    Url(String),
+    User(String),
+    Channel(String),
+}
+
+struct Span {
+    range: Range<usize>,
+    kind: char,
+    id: String,
+}
+
+/// Strips the markers left by [`resolve_rich`], remapping highlight ranges and
+/// returning the mention spans in the cleaned text.
+fn extract_mentions(
+    text: &str,
+    hl: Vec<(Range<usize>, HighlightStyle)>,
+) -> (String, Vec<(Range<usize>, HighlightStyle)>, Vec<Span>) {
+    let mut out = String::with_capacity(text.len());
+    let mut map = vec![0usize; text.len() + 1];
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i..].chars().next().unwrap();
+        let cl = c.len_utf8();
+        if c == MARK_OPEN {
+            if let Some(e1) = text[i..].find(MARK_CLOSE) {
+                let seg = &text[i + cl..i + e1];
+                if let Some(e2) = seg.find(MARK_SEP) {
+                    let head = &seg[..e2];
+                    let label = &seg[e2 + MARK_SEP.len_utf8()..];
+                    let kind = head.chars().next().unwrap_or('u');
+                    let id = head[kind.len_utf8()..].to_string();
+                    let end = i + e1 + MARK_CLOSE.len_utf8();
+                    for b in map.iter_mut().take(end).skip(i) {
+                        *b = out.len();
+                    }
+                    let start = out.len();
+                    out.push_str(label);
+                    spans.push(Span {
+                        range: start..out.len(),
+                        kind,
+                        id,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        for b in 0..cl {
+            map[i + b] = out.len() + b;
+        }
+        out.push(c);
+        i += cl;
+    }
+    map[text.len()] = out.len();
+    let hl = hl
+        .into_iter()
+        .filter_map(|(r, s)| {
+            let (a, b) = (map[r.start.min(text.len())], map[r.end.min(text.len())]);
+            (a < b).then_some((a..b, s))
+        })
+        .collect();
+    // Literal @everyone / @here.
+    for word in ["@everyone", "@here"] {
+        let mut from = 0;
+        while let Some(p) = out[from..].find(word) {
+            let s = from + p;
+            spans.push(Span {
+                range: s..s + word.len(),
+                kind: 'e',
+                id: String::new(),
+            });
+            from = s + word.len();
+        }
+    }
+    spans.sort_by_key(|s| s.range.start);
+    (out, hl, spans)
+}
+
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
 /// Tiny Markdown subset: **bold**, *italic*, __underline__, ~~strike~~, `code`, ```blocks```, links.
 /// With `keep_markers` the output equals `src` (live styling for the composer).
 fn markdown(src: &str, keep_markers: bool) -> (String, Vec<(Range<usize>, HighlightStyle)>) {
@@ -320,6 +584,15 @@ fn markdown(src: &str, keep_markers: bool) -> (String, Vec<(Range<usize>, Highli
     let mut hl: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut rest = src;
     'outer: while !rest.is_empty() {
+        // Mention markers are opaque: never interpret Markdown inside them.
+        if rest.starts_with(MARK_OPEN) {
+            if let Some(end) = rest.find(MARK_CLOSE) {
+                let end = end + MARK_CLOSE.len_utf8();
+                out.push_str(&rest[..end]);
+                rest = &rest[end..];
+                continue 'outer;
+            }
+        }
         for (m, style) in &markers {
             if !rest.starts_with(m) {
                 continue;
@@ -2338,8 +2611,7 @@ impl DiscordApp {
                     .child(u.display_name().to_string()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.profile = Some(user.clone());
-                cx.notify();
+                this.open_profile(user.clone(), cx);
             }))
     }
 
@@ -2359,7 +2631,11 @@ impl DiscordApp {
                                 .map(|r| r.name.to_uppercase())
                                 .unwrap_or_else(|| "RÔLE".into()),
                         };
-                        panel = panel.child(Self::section_label(format!("{name} — {count}")));
+                        let tint = self.roles.get(id).map(|r| r.color).filter(|c| *c != 0);
+                        panel = panel.child(
+                            Self::section_label(format!("{name} — {count}"))
+                                .when_some(tint, |d, c| d.text_color(rgb(c))),
+                        );
                     }
                     MemberRow::Member { user, status, .. } => {
                         panel = panel.child(self.person_row(user, Some(status), cx));
@@ -2545,13 +2821,280 @@ impl DiscordApp {
     }
 
     fn profile_overlay(&self, user: &User, cx: &mut Context<Self>) -> AnyElement {
-        let u = user.clone();
-        let (u2, id) = (user.clone(), user.id.clone());
-        let is_me = self.me.as_ref().is_some_and(|m| m.id == user.id);
+        let data = self.profile_data.as_ref();
+        let u = data.map(|d| &d.user).unwrap_or(user).clone();
+        let is_me = self.me.as_ref().is_some_and(|m| m.id == u.id);
+        let accent = data
+            .and_then(|d| d.accent_color)
+            .or(u.accent_color)
+            .unwrap_or_else(color::brand);
+        let banner: AnyElement = match u.banner_url().and_then(|b| self.images.get(&b).cloned()) {
+            Some(i) => img(i)
+                .w_full()
+                .h(px(110.))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => div()
+                .w_full()
+                .h(px(110.))
+                .bg(rgb(accent))
+                .into_any_element(),
+        };
+
+        // Display name: guild nickname first.
+        let shown = data
+            .and_then(|d| d.nick.clone())
+            .unwrap_or_else(|| u.display_name().to_string());
+        let tint = self.name_color(&u.id);
+        let mut name_row = div().flex().items_center().gap_2().child(
+            div()
+                .text_size(px(22.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(tint.unwrap_or_else(color::bright)))
+                .child(shown),
+        );
+        if u.bot {
+            name_row = name_row.child(Self::chip("BOT", color::brand(), 0xffffff));
+        }
+        if let Some(tag) = u.tag() {
+            name_row = name_row.child(Self::chip(tag, color::active(), color::bright()));
+        }
+        let mut sub = u.username.clone();
+        if let Some(p) = data.and_then(|d| d.pronouns.clone()) {
+            sub = format!("{sub} · {p}");
+        }
+        let status = self.presence.get(&u.id).map(|s| s.as_str());
+
+        // Badges: server-provided icons, else text badges from the public flags.
+        let mut badges = div().flex().flex_wrap().gap_1();
+        let mut any_badge = false;
+        for b in data.map(|d| d.badges.as_slice()).unwrap_or(&[]) {
+            any_badge = true;
+            badges = badges.child(match self.images.get(&b.url()) {
+                Some(i) => img(i.clone()).size(px(22.)).into_any_element(),
+                None => {
+                    Self::chip(&b.description, color::active(), color::bright()).into_any_element()
+                }
+            });
+        }
+        if !any_badge {
+            for (bit, label) in FLAG_BADGES {
+                if u.public_flags & bit != 0 {
+                    any_badge = true;
+                    badges = badges.child(Self::chip(label, color::active(), color::bright()));
+                }
+            }
+        }
+
+        // Body sections.
+        let mut body = div().flex().flex_col().gap_3();
+        let section = |title: &str| {
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(color::bright()))
+                .child(title.to_string())
+        };
+        if self.profile_loading && data.is_none() {
+            body = body
+                .child(skeleton("sk-pf-1", Some(220.), 14., Some(6.)))
+                .child(skeleton("sk-pf-2", Some(300.), 14., Some(6.)))
+                .child(skeleton("sk-pf-3", Some(160.), 14., Some(6.)));
+        }
+        if !self.profile_err.is_empty() {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(color::muted()))
+                    .child(format!(
+                        "Profil complet indisponible : {}",
+                        self.profile_err
+                    )),
+            );
+        }
+        if let Some(bio) = data.and_then(|d| d.bio.clone()) {
+            let (text, hl) = markdown(&bio, false);
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(section("À PROPOS DE MOI"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(StyledText::new(text).with_highlights(hl)),
+                    ),
+            );
+        }
+        let mut dates = div().flex().gap_6();
+        dates = dates.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(section("MEMBRE DE DISCORD DEPUIS"))
+                .child(div().text_sm().child(fmt_date_ms(u.created_ms()))),
+        );
+        if let Some(j) = data.and_then(|d| d.joined_at.clone()) {
+            dates = dates.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(section("MEMBRE DU SERVEUR DEPUIS"))
+                    .child(div().text_sm().child(fmt_date_iso(&j))),
+            );
+        }
+        body = body.child(dates);
+
+        if let Some(d) = data {
+            let mut roles: Vec<(&String, &api::Role)> = d
+                .member_roles
+                .iter()
+                .filter_map(|id| self.roles.get(id).map(|r| (id, r)))
+                .collect();
+            roles.sort_by_key(|(_, r)| std::cmp::Reverse(r.position));
+            if !roles.is_empty() {
+                body =
+                    body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(section("RÔLES"))
+                            .child(div().flex().flex_wrap().gap_1().children(
+                                roles.into_iter().map(|(_, r)| {
+                                    div()
+                                        .px_2()
+                                        .py(px(2.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(color::active()))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .child(div().size(px(10.)).rounded_full().bg(rgb(
+                                            if r.color != 0 {
+                                                r.color
+                                            } else {
+                                                color::muted()
+                                            },
+                                        )))
+                                        .child(r.name.clone())
+                                }),
+                            )),
+                    );
+            }
+            if let Some(since) = &d.premium_since {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(section("NITRO"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(format!("Abonné depuis le {}", fmt_date_iso(since))),
+                        ),
+                );
+            }
+            if let Some(since) = &d.premium_guild_since {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(section("BOOSTE UN SERVEUR"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(format!("Depuis le {}", fmt_date_iso(since))),
+                        ),
+                );
+            }
+            if !d.mutual_guilds.is_empty() || d.mutual_friends_count > 0 {
+                let names: Vec<String> = d
+                    .mutual_guilds
+                    .iter()
+                    .map(|(id, nick)| {
+                        let n = self
+                            .guilds
+                            .iter()
+                            .find(|g| &g.id == id)
+                            .map(|g| g.name.clone())
+                            .unwrap_or_else(|| "Serveur".into());
+                        match nick {
+                            Some(nick) => format!("{n} ({nick})"),
+                            None => n,
+                        }
+                    })
+                    .collect();
+                let more = names.len().saturating_sub(8);
+                let mut block = div().flex().flex_col().gap_1();
+                if !names.is_empty() {
+                    block = block
+                        .child(section(&format!("SERVEURS EN COMMUN — {}", names.len())))
+                        .child(
+                            div().flex().flex_wrap().gap_1().children(
+                                names
+                                    .into_iter()
+                                    .take(8)
+                                    .map(|n| Self::chip(&n, color::active(), color::bright())),
+                            ),
+                        );
+                    if more > 0 {
+                        block = block.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(color::muted()))
+                                .child(format!("+ {more} autres")),
+                        );
+                    }
+                }
+                if d.mutual_friends_count > 0 {
+                    block = block.child(div().text_sm().child(format!(
+                        "{} ami{} en commun",
+                        d.mutual_friends_count,
+                        if d.mutual_friends_count > 1 { "s" } else { "" }
+                    )));
+                }
+                body = body.child(block);
+            }
+            if !d.connections.is_empty() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(section("CONNEXIONS"))
+                        .children(d.connections.iter().map(|c| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(color::bright()))
+                                        .child(connection_label(&c.kind)),
+                                )
+                                .child(div().text_color(rgb(color::muted())).child(c.name.clone()))
+                                .when(c.verified, |d| {
+                                    d.child(div().text_color(rgb(color::green())).child("✓"))
+                                })
+                        })),
+                );
+            }
+        }
+
+        let (u2, id) = (u.clone(), u.id.clone());
         let button = |label: &'static str, id: &'static str, primary: bool| {
             div()
                 .id(id)
-                .h(px(36.))
+                .h(px(34.))
                 .px_4()
                 .rounded(px(3.))
                 .flex()
@@ -2566,6 +3109,7 @@ impl DiscordApp {
                 }))
                 .child(label)
         };
+        let max_h = (self.height - 48.).max(240.);
         div()
             .id("profile-backdrop")
             .absolute()
@@ -2578,18 +3122,20 @@ impl DiscordApp {
             .justify_center()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.profile = None;
+                this.profile_data = None;
                 cx.notify();
             }))
             .child(
                 div()
                     .id("profile")
-                    .w(px(360.0_f32.min(self.width - 32.)))
+                    .w(px(420.0_f32.min(self.width - 32.)))
+                    .max_h(px(max_h))
                     .rounded(px(8.))
                     .bg(rgb(color::sidebar()))
                     .shadow_lg()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(div().h(px(80.)).bg(rgb(color::brand())))
+                    .child(banner)
                     .child(
                         div()
                             .px_4()
@@ -2599,36 +3145,29 @@ impl DiscordApp {
                             .gap_3()
                             .child(
                                 div()
-                                    .mt(px(-40.))
-                                    .size(px(88.))
+                                    .mt(px(-44.))
+                                    .size(px(96.))
                                     .rounded_full()
-                                    .border_4()
-                                    .border_color(rgb(color::sidebar()))
-                                    .child(self.avatar(&u, 80.)),
+                                    .bg(rgb(color::sidebar()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(self.avatar_status(&u, 84., color::sidebar())),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(
+                                    .child(name_row)
+                                    .child(div().text_color(rgb(color::muted())).child(sub))
+                                    .children(status.map(|s| {
                                         div()
-                                            .text_size(px(20.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(color::bright()))
-                                            .child(u.display_name().to_string()),
-                                    )
-                                    .child(
-                                        div()
+                                            .text_xs()
                                             .text_color(rgb(color::muted()))
-                                            .child(u.username.clone()),
-                                    ),
+                                            .child(status_label(s))
+                                    })),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(color::muted()))
-                                    .child(format!("ID : {}", u.id)),
-                            )
+                            .when(any_badge, |d| d.child(badges))
                             .child(
                                 div()
                                     .flex()
@@ -2653,10 +3192,29 @@ impl DiscordApp {
                                             ))
                                         }),
                                     )),
+                            )
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded(px(8.))
+                                    .bg(rgb(color::chat()))
+                                    .child(body),
                             ),
                     ),
             )
             .into_any_element()
+    }
+
+    fn chip(text: &str, bg: u32, fg: u32) -> Div {
+        div()
+            .px_2()
+            .py(px(1.))
+            .rounded(px(4.))
+            .bg(rgb(bg))
+            .text_size(px(11.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(fg))
+            .child(text.to_string())
     }
 
     fn settings_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2871,7 +3429,8 @@ impl DiscordApp {
                 }
             }
             let grouped = !new_day
-                && m.referenced_message.is_none()
+                && m.kind != 19
+                && !matches!(m.kind, 1..=18 | 21)
                 && match (&prev, &time) {
                     (Some((p, pt)), Some(t)) => {
                         p.author.id == m.author.id && (*t - *pt).num_minutes() < GROUP_MINUTES
@@ -2909,30 +3468,67 @@ impl DiscordApp {
     }
 
     /// Message text with mentions resolved and Markdown applied.
-    fn rich_text(&self, m: &Message, edited: bool) -> AnyElement {
+    fn rich_text(&self, m: &Message, edited: bool, cx: &mut Context<Self>) -> AnyElement {
         let lookup = |kind: char, id: &str| -> Option<String> {
             match kind {
-                '@' => m
+                'u' => m
                     .mentions
                     .iter()
                     .find(|u| u.id == id)
                     .map(|u| u.display_name().to_string())
                     .or_else(|| self.known_users.get(id).cloned())
                     .map(|n| format!("@{n}")),
-                '#' => self
+                'r' => self.roles.get(id).map(|r| format!("@{}", r.name)),
+                'c' => self
                     .channels
                     .iter()
+                    .chain(&self.threads)
+                    .chain(&self.dms)
                     .find(|c| c.id == id)
                     .map(|c| format!("#{}", c.title())),
+                't' => {
+                    let (secs, style) = id.split_once(':').unwrap_or((id, "f"));
+                    secs.parse::<i64>().ok().map(|s| fmt_timestamp(s, style))
+                }
                 _ => None,
             }
         };
-        let resolved = resolve_tokens(&m.content, &lookup);
-        let (mut text, mut hl) = markdown(&resolved, false);
+        let resolved = resolve_rich(&m.content, &lookup);
+        let (text0, hl0) = markdown(&resolved, false);
+        let (mut text, hl, spans) = extract_mentions(&text0, hl0);
+
+        // Mention chips win over Markdown styling on the same characters.
+        let mut styled: Vec<(Range<usize>, HighlightStyle)> = hl
+            .into_iter()
+            .filter(|(r, _)| !spans.iter().any(|s| overlaps(&s.range, r)))
+            .collect();
+        for s in &spans {
+            let role_color = (s.kind == 'r')
+                .then(|| self.roles.get(&s.id).map(|r| r.color).filter(|c| *c != 0))
+                .flatten();
+            let style = match (s.kind, role_color) {
+                (_, Some(c)) => HighlightStyle {
+                    color: Some(rgb(c).into()),
+                    background_color: Some(rgba((c << 8) | 0x33).into()),
+                    ..Default::default()
+                },
+                ('t', _) => HighlightStyle {
+                    background_color: Some(rgba(0x80808040).into()),
+                    ..Default::default()
+                },
+                _ => HighlightStyle {
+                    color: Some(rgb(color::mention_fg()).into()),
+                    background_color: Some(rgba(0x5865f24d).into()),
+                    font_weight: Some(FontWeight::MEDIUM),
+                    ..Default::default()
+                },
+            };
+            styled.push((s.range.clone(), style));
+        }
         if edited {
             let start = text.len();
             text.push_str(" (modifié)");
-            hl.push((
+            styled.push((
                 start..text.len(),
                 HighlightStyle {
                     color: Some(rgb(color::muted()).into()),
@@ -2940,15 +3536,206 @@ impl DiscordApp {
                 },
             ));
         }
-        let links = link_ranges(&text);
-        let ranges: Vec<Range<usize>> = links.iter().map(|(r, _)| r.clone()).collect();
-        let urls: Vec<String> = links.into_iter().map(|(_, u)| u).collect();
+        styled.sort_by_key(|(r, _)| r.start);
+
+        // Clickable ranges: user / channel mentions, then plain links.
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        let mut actions: Vec<Action> = Vec::new();
+        for s in &spans {
+            match s.kind {
+                'u' => {
+                    ranges.push(s.range.clone());
+                    actions.push(Action::User(s.id.clone()));
+                }
+                'c' => {
+                    ranges.push(s.range.clone());
+                    actions.push(Action::Channel(s.id.clone()));
+                }
+                _ => {}
+            }
+        }
+        for (r, url) in link_ranges(&text) {
+            ranges.push(r);
+            actions.push(Action::Url(url));
+        }
+        let weak = cx.entity().downgrade();
         InteractiveText::new(
             SharedString::from(format!("t-{}", m.id)),
-            StyledText::new(text).with_highlights(hl),
+            StyledText::new(text).with_highlights(styled),
         )
-        .on_click(ranges, move |ix, _, cx| cx.open_url(&urls[ix]))
+        .on_click(ranges, move |ix, _, app| match &actions[ix] {
+            Action::Url(u) => app.open_url(u),
+            Action::User(id) => {
+                let id = id.clone();
+                weak.update(app, |this, cx| this.open_profile_id(&id, cx))
+                    .ok();
+            }
+            Action::Channel(id) => {
+                let id = id.clone();
+                weak.update(app, |this, cx| this.open_channel_id(&id, cx))
+                    .ok();
+            }
+        })
         .into_any_element()
+    }
+
+    /// Single-line preview of a message for reply headers.
+    fn preview_text(&self, m: &Message) -> String {
+        let lookup = |kind: char, id: &str| -> Option<String> {
+            match kind {
+                'u' => m
+                    .mentions
+                    .iter()
+                    .find(|u| u.id == id)
+                    .map(|u| u.display_name().to_string())
+                    .or_else(|| self.known_users.get(id).cloned())
+                    .map(|n| format!("@{n}")),
+                'r' => self.roles.get(id).map(|r| format!("@{}", r.name)),
+                'c' => self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| format!("#{}", c.title())),
+                _ => None,
+            }
+        };
+        let (text, _) = markdown(
+            &resolve_tokens(&m.content, &|k, i| {
+                lookup(
+                    match k {
+                        '@' => 'u',
+                        '&' => 'r',
+                        other => other,
+                    },
+                    i,
+                )
+            }),
+            false,
+        );
+        let text = text.replace('\n', " ");
+        if text.trim().is_empty() {
+            if m.attachments.is_empty() && m.embeds.is_empty() {
+                "(message vide)".into()
+            } else {
+                "Cliquez pour voir la pièce jointe".into()
+            }
+        } else {
+            text
+        }
+    }
+
+    fn reply_header(&self, m: &Message, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if m.kind != 19 && m.referenced_message.is_none() {
+            return None;
+        }
+        let connector = div()
+            .w(px(24.))
+            .h(px(10.))
+            .mt(px(6.))
+            .flex_shrink_0()
+            .border_l_2()
+            .border_t_2()
+            .border_color(rgb(color::divider()))
+            .rounded_tl(px(6.));
+        let body: AnyElement = match &m.referenced_message {
+            Some(r) => {
+                let author = r.author.clone();
+                let tint = self.name_color(&r.author.id).unwrap_or_else(color::muted);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .flex_1()
+                    .child(self.avatar(&r.author, 16.))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("rp-{}", m.id)))
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(tint))
+                            .cursor_pointer()
+                            .hover(|d| d.underline())
+                            .child(format!("@{}", r.author.display_name()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_profile(author.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.preview_text(r)),
+                    )
+                    .into_any_element()
+            }
+            None => div()
+                .italic()
+                .child("Le message d'origine a été supprimé.")
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .ml(px(20.))
+                .mb(px(2.))
+                .flex()
+                .items_start()
+                .gap_2()
+                .text_sm()
+                .text_color(rgb(color::muted()))
+                .overflow_hidden()
+                .child(connector)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// Join / pin / boost / thread-created lines.
+    fn system_row(&self, m: &Message, time: Option<&DateTime<Local>>) -> AnyElement {
+        let who = m.author.display_name().to_string();
+        let (icon, text) = match m.kind {
+            1 => ("→", format!("{who} a ajouté quelqu'un au groupe.")),
+            2 => ("←", format!("{who} a retiré quelqu'un du groupe.")),
+            3 => ("☎", format!("{who} a démarré un appel.")),
+            4 => (
+                "✎",
+                format!("{who} a changé le nom du groupe : {}", m.content),
+            ),
+            5 => ("✎", format!("{who} a changé l'icône du groupe.")),
+            6 => ("📌", format!("{who} a épinglé un message à ce salon.")),
+            7 => ("→", format!("{who} a rejoint le serveur.")),
+            8..=11 => ("✦", format!("{who} a boosté le serveur !")),
+            18 => ("⤷", format!("{who} a créé un fil : {}", m.content)),
+            21 => ("⤷", format!("Message de départ du fil par {who}.")),
+            _ => ("•", format!("Message système de {who}.")),
+        };
+        let accent = match m.kind {
+            7 | 1 => color::green(),
+            8..=11 => 0xf47fff,
+            _ => color::muted(),
+        };
+        div()
+            .px_4()
+            .py(px(4.))
+            .mt(px(8.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .text_color(rgb(color::muted()))
+            .child(
+                div()
+                    .w(px(40.))
+                    .flex()
+                    .justify_end()
+                    .text_color(rgb(accent))
+                    .child(icon),
+            )
+            .child(div().flex_1().min_w_0().child(text))
+            .children(time.map(|t| div().text_xs().child(stamp(t))))
+            .into_any_element()
     }
 
     fn attachment(&self, a: &crate::api::Attachment) -> AnyElement {
@@ -3204,6 +3991,9 @@ impl DiscordApp {
         grouped: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if matches!(m.kind, 1..=18 | 21) && m.kind != 19 {
+            return self.system_row(m, time);
+        }
         let group: SharedString = format!("m-{}", m.id).into();
         let name = m.author.display_name().to_string();
 
@@ -3217,6 +4007,12 @@ impl DiscordApp {
                         .unwrap_or_else(color::bright)))
                     .child(name.clone()),
             );
+            if m.author.bot {
+                head = head.child(Self::chip("BOT", color::brand(), 0xffffff));
+            }
+            if let Some(tag) = m.author.tag() {
+                head = head.child(Self::chip(tag, color::active(), color::bright()));
+            }
             if let Some(t) = time {
                 head = head.child(
                     div()
@@ -3228,10 +4024,30 @@ impl DiscordApp {
             text = text.child(head);
         }
         if !m.content.is_empty() {
-            text = text.child(self.rich_text(m, m.edited_timestamp.is_some()));
+            text = text.child(self.rich_text(m, m.edited_timestamp.is_some(), cx));
         }
         for a in &m.attachments {
             text = text.child(div().mt_1().child(self.attachment(a)));
+        }
+        for s in &m.sticker_items {
+            let el: AnyElement = match s.url() {
+                Some(url) => match self.images.get(&url) {
+                    Some(i) => img(i.clone())
+                        .size(px(120.))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element(),
+                    None if self.image_failed.contains(&url) => div()
+                        .text_color(rgb(color::muted()))
+                        .child(format!("[Sticker : {}]", s.name))
+                        .into_any_element(),
+                    None => skeleton(format!("sk-st-{}", s.id), Some(120.), 120., Some(8.)),
+                },
+                None => div()
+                    .text_color(rgb(color::muted()))
+                    .child(format!("[Sticker : {}]", s.name))
+                    .into_any_element(),
+            };
+            text = text.child(div().mt_1().child(el));
         }
         for e in &m.embeds {
             text = text.child(self.embed(e));
@@ -3301,8 +4117,7 @@ impl DiscordApp {
                 .cursor_pointer()
                 .child(self.avatar(&m.author, 40.))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.profile = Some(a.clone());
-                    cx.notify();
+                    this.open_profile(a.clone(), cx);
                 }))
                 .into_any_element()
         };
@@ -3327,31 +4142,8 @@ impl DiscordApp {
             .flex()
             .flex_col();
 
-        if let Some(r) = &m.referenced_message {
-            row = row.child(
-                div()
-                    .ml(px(20.))
-                    .mb(px(2.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(rgb(color::muted()))
-                    .overflow_hidden()
-                    .child("↱")
-                    .child(self.avatar(&r.author, 16.))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("@{}", r.author.display_name())),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(r.content.replace('\n', " ")),
-                    ),
-            );
+        if let Some(header) = self.reply_header(m, cx) {
+            row = row.child(header);
         }
         row.child(div().flex().gap_4().child(gutter).child(text))
             .child(self.toolbar(m, group, cx))

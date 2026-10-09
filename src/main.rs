@@ -130,11 +130,17 @@ pub struct DiscordApp {
     member_roles: HashMap<String, Vec<String>>,
     presence: HashMap<String, String>,
     session_id: Option<String>,
+    all_roles: HashMap<String, HashMap<String, api::Role>>,
+    users: HashMap<String, User>,
+    profile_data: Option<api::Profile>,
+    profile_loading: bool,
+    profile_err: String,
     /// Channels whose history we may not read / post in (HTTP 403).
     forbidden: HashSet<String>,
     no_send: HashSet<String>,
     loading_messages: bool,
     width: f32,
+    height: f32,
     nav_open: bool,
     status_at: Option<Instant>,
     last_status_seen: String,
@@ -254,10 +260,16 @@ impl DiscordApp {
             member_roles: HashMap::new(),
             presence: HashMap::new(),
             session_id: None,
+            all_roles: HashMap::new(),
+            users: HashMap::new(),
+            profile_data: None,
+            profile_loading: false,
+            profile_err: String::new(),
             forbidden: HashSet::new(),
             no_send: HashSet::new(),
             loading_messages: false,
             width: 1280.0,
+            height: 780.0,
             nav_open: false,
             status_at: None,
             last_status_seen: String::new(),
@@ -819,6 +831,7 @@ impl DiscordApp {
                 .await
             {
                 this.update(cx, |this, cx| {
+                    this.all_roles.insert(guild.clone(), r.clone());
                     if this.guild.as_deref() == Some(&guild) {
                         this.roles = r;
                         cx.notify();
@@ -1170,6 +1183,61 @@ impl DiscordApp {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Opens the profile popup and loads the full profile in the background.
+    pub fn open_profile(&mut self, user: User, cx: &mut Context<Self>) {
+        self.users.insert(user.id.clone(), user.clone());
+        self.profile = Some(user.clone());
+        self.profile_data = None;
+        self.profile_err.clear();
+        if self.auth.starts_with("Bot ") {
+            return cx.notify();
+        }
+        self.profile_loading = true;
+        let (auth, guild, id) = (self.auth.clone(), self.guild.clone(), user.id);
+        cx.spawn(async move |this, cx| {
+            let uid = id.clone();
+            let res = cx
+                .background_spawn(async move { api::profile(&auth, &uid, guild.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.profile.as_ref().map(|u| &u.id) != Some(&id) {
+                    return;
+                }
+                this.profile_loading = false;
+                match res {
+                    Ok(p) => this.profile_data = Some(p),
+                    Err(e) => this.profile_err = e,
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn open_channel_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        let found = self
+            .channels
+            .iter()
+            .chain(&self.threads)
+            .chain(&self.dms)
+            .find(|c| c.id == id)
+            .cloned();
+        if let Some(c) = found {
+            self.select_channel(c, cx);
+        }
+    }
+
+    pub fn open_profile_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        let user = self.users.get(id).cloned().unwrap_or_else(|| User {
+            id: id.to_string(),
+            username: "Utilisateur inconnu".into(),
+            ..Default::default()
+        });
+        self.open_profile(user, cx);
     }
 
     pub fn pick_custom(&mut self, e: &GuildEmoji, cx: &mut Context<Self>) {
@@ -1660,12 +1728,23 @@ impl DiscordApp {
                         } = r
                         {
                             self.member_roles.insert(user.id.clone(), roles.clone());
+                            self.users.insert(user.id.clone(), user.clone());
                             self.presence
                                 .entry(user.id.clone())
                                 .or_insert_with(|| status.clone());
                         }
                     }
                     self.members = rows;
+                }
+            }
+            Roles(list) => {
+                for (gid, roles) in list {
+                    self.all_roles.insert(gid, roles.into_iter().collect());
+                }
+                if let Some(g) = &self.guild {
+                    if let Some(r) = self.all_roles.get(g) {
+                        self.roles = r.clone();
+                    }
                 }
             }
             Session(id) => self.session_id = Some(id),
@@ -1804,6 +1883,15 @@ impl DiscordApp {
         for m in msgs {
             self.known_users
                 .insert(m.author.id.clone(), m.author.display_name().to_string());
+            self.users.insert(m.author.id.clone(), m.author.clone());
+            for u in &m.mentions {
+                self.known_users
+                    .insert(u.id.clone(), u.display_name().to_string());
+                self.users.insert(u.id.clone(), u.clone());
+            }
+            if let Some(r) = &m.referenced_message {
+                self.users.insert(r.author.id.clone(), r.author.clone());
+            }
         }
     }
 
@@ -1811,6 +1899,7 @@ impl DiscordApp {
         for r in dms.iter().flat_map(|c| &c.recipients) {
             self.known_users
                 .insert(r.id.clone(), r.display_name().to_string());
+            self.users.insert(r.id.clone(), r.clone());
         }
     }
 
@@ -1865,9 +1954,11 @@ impl DiscordApp {
         self.channels.clear();
         self.members.clear();
         self.threads.clear();
-        self.roles.clear();
+        self.roles = self.all_roles.get(&id).cloned().unwrap_or_default();
         self.member_roles.clear();
-        self.fetch_roles(id.clone(), cx);
+        if self.roles.is_empty() {
+            self.fetch_roles(id.clone(), cx);
+        }
         self.reset_channel();
         let auth = self.auth.clone();
         if !self.guild_emojis.contains_key(&id) {
@@ -2032,6 +2123,14 @@ impl DiscordApp {
                 );
             }
         }
+        if let Some(p) = &self.profile_data {
+            wanted.extend(p.user.banner_url());
+            wanted.extend(p.badges.iter().map(|b| b.url()));
+            wanted.extend(p.user.avatar_url());
+        }
+        for m in self.messages.iter().flat_map(|m| &m.sticker_items) {
+            wanted.extend(m.url());
+        }
         for row in &self.members {
             if let gateway::MemberRow::Member { user, .. } = row {
                 wanted.extend(user.avatar_url());
@@ -2130,6 +2229,7 @@ impl Render for DiscordApp {
         }
         self.window_active = window.is_window_active();
         self.width = f32::from(window.viewport_size().width);
+        self.height = f32::from(window.viewport_size().height);
         if self.status != self.last_status_seen {
             self.last_status_seen = self.status.clone();
             self.status_at = Some(Instant::now());

@@ -13,7 +13,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::{client, Message as Ws};
 
-use crate::api::{self, Message, User};
+use crate::api::{self, Message, Role, User};
 
 const DEFAULT_URL: &str = "wss://gateway.discord.gg/?v=9&encoding=json";
 
@@ -52,6 +52,8 @@ pub enum Event {
     MembersStale {
         guild_id: String,
     },
+    /// Roles per guild, taken from READY (avoids a REST call per guild).
+    Roles(Vec<(String, Vec<(String, Role)>)>),
     /// Our session id (needed to run slash commands).
     Session(String),
     /// Initial presences of friends: (user id, status).
@@ -273,6 +275,7 @@ fn run(
                         let _ = tx.send(Event::Session(id.clone()));
                     }
                     let _ = tx.send(Event::Presences(ready_presences(&v["d"])));
+                    let _ = tx.send(Event::Roles(ready_roles(&v["d"])));
                 } else if kind == "RESUMED" && tx.send(Event::Connected(true)).is_err() {
                     return Ok(());
                 }
@@ -286,6 +289,33 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// Guild roles carried by READY's `guilds` (user accounts).
+fn ready_roles(d: &Value) -> Vec<(String, Vec<(String, Role)>)> {
+    d["guilds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            let id = g["id"].as_str()?.to_string();
+            let roles = g["roles"]
+                .as_array()?
+                .iter()
+                .filter_map(|r| {
+                    Some((
+                        r["id"].as_str()?.to_string(),
+                        Role {
+                            name: r["name"].as_str()?.to_string(),
+                            color: r["color"].as_u64().unwrap_or(0) as u32,
+                            position: r["position"].as_i64().unwrap_or(0),
+                        },
+                    ))
+                })
+                .collect();
+            Some((id, roles))
+        })
+        .collect()
 }
 
 /// Friend presences from READY (shape differs between gateway versions).

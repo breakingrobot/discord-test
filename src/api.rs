@@ -20,9 +20,51 @@ pub struct User {
     pub global_name: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub bot: bool,
+    #[serde(default)]
+    pub public_flags: u64,
+    /// Guild tag ("clan") shown next to the name.
+    #[serde(default)]
+    pub primary_guild: Option<PrimaryGuild>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PrimaryGuild {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub identity_enabled: Option<bool>,
 }
 
 impl User {
+    /// Guild tag when the user displays one.
+    pub fn tag(&self) -> Option<&str> {
+        let g = self.primary_guild.as_ref()?;
+        if g.identity_enabled == Some(false) {
+            return None;
+        }
+        g.tag.as_deref().filter(|t| !t.is_empty())
+    }
+
+    pub fn banner_url(&self) -> Option<String> {
+        self.banner.as_ref().map(|h| {
+            format!(
+                "https://cdn.discordapp.com/banners/{}/{h}.png?size=480",
+                self.id
+            )
+        })
+    }
+
+    /// Account creation time (ms since epoch), derived from the snowflake.
+    pub fn created_ms(&self) -> u64 {
+        (self.id.parse::<u64>().unwrap_or(0) >> 22) + 1_420_070_400_000
+    }
+
     pub fn display_name(&self) -> &str {
         self.global_name.as_deref().unwrap_or(&self.username)
     }
@@ -252,6 +294,45 @@ pub struct Message {
     /// Thread started from this message.
     #[serde(default)]
     pub thread: Option<Box<Channel>>,
+    /// 0 default, 19 reply, 6 pin, 7 join, 18 thread created, 21 thread starter, …
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub message_reference: Option<MessageRef>,
+    #[serde(default)]
+    pub mention_roles: Vec<String>,
+    #[serde(default)]
+    pub sticker_items: Vec<Sticker>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MessageRef {
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Sticker {
+    pub id: String,
+    pub name: String,
+    /// 1 PNG, 2 APNG, 3 Lottie, 4 GIF.
+    #[serde(default)]
+    pub format_type: u8,
+}
+
+impl Sticker {
+    pub fn url(&self) -> Option<String> {
+        matches!(self.format_type, 1 | 2 | 4).then(|| {
+            format!(
+                "https://media.discordapp.net/stickers/{}.png?size=160",
+                self.id
+            )
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -265,6 +346,44 @@ pub struct Role {
     pub name: String,
     pub color: u32,
     pub position: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Badge {
+    pub description: String,
+    pub icon: String,
+}
+
+impl Badge {
+    pub fn url(&self) -> String {
+        format!("https://cdn.discordapp.com/badge-icons/{}.png", self.icon)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Connection {
+    pub kind: String,
+    pub name: String,
+    pub verified: bool,
+}
+
+/// Full profile as returned by `GET /users/{id}/profile`.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub user: User,
+    pub bio: Option<String>,
+    pub pronouns: Option<String>,
+    pub accent_color: Option<u32>,
+    pub badges: Vec<Badge>,
+    pub connections: Vec<Connection>,
+    /// (guild id, nickname)
+    pub mutual_guilds: Vec<(String, Option<String>)>,
+    pub mutual_friends_count: u32,
+    pub premium_since: Option<String>,
+    pub premium_guild_since: Option<String>,
+    pub joined_at: Option<String>,
+    pub nick: Option<String>,
+    pub member_roles: Vec<String>,
 }
 
 /// Client fingerprint sent both as a header and in the gateway IDENTIFY.
@@ -934,4 +1053,73 @@ pub fn forum_post(token: &str, forum: &str, title: &str, content: &str) -> Resul
     )?
     .into_json()
     .map_err(|e| e.to_string())
+}
+
+/// Full profile, optionally as seen in a guild (nickname, roles, join date).
+pub fn profile(token: &str, user_id: &str, guild: Option<&str>) -> Result<Profile, String> {
+    let mut path =
+        format!("/users/{user_id}/profile?with_mutual_guilds=true&with_mutual_friends_count=true");
+    if let Some(g) = guild {
+        path.push_str(&format!("&guild_id={g}"));
+    }
+    let v: Value = get(token, &path)?;
+    let s = |x: &Value| x.as_str().filter(|t| !t.is_empty()).map(str::to_string);
+    let mut user: User = serde_json::from_value(v["user"].clone()).unwrap_or_default();
+    if user.id.is_empty() {
+        user.id = user_id.to_string();
+    }
+    let meta = &v["user_profile"];
+    let gmeta = &v["guild_member_profile"];
+    // Guild-specific bio / pronouns win when set.
+    let pick = |k: &str| {
+        s(&gmeta[k])
+            .or_else(|| s(&meta[k]))
+            .or_else(|| s(&v["user"][k]))
+    };
+    Ok(Profile {
+        bio: pick("bio"),
+        pronouns: pick("pronouns"),
+        accent_color: meta["accent_color"].as_u64().map(|c| c as u32),
+        badges: v["badges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| {
+                Some(Badge {
+                    description: b["description"].as_str()?.to_string(),
+                    icon: b["icon"].as_str()?.to_string(),
+                })
+            })
+            .collect(),
+        connections: v["connected_accounts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some(Connection {
+                    kind: c["type"].as_str()?.to_string(),
+                    name: c["name"].as_str()?.to_string(),
+                    verified: c["verified"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect(),
+        mutual_guilds: v["mutual_guilds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| Some((g["id"].as_str()?.to_string(), s(&g["nick"]))))
+            .collect(),
+        mutual_friends_count: v["mutual_friends_count"].as_u64().unwrap_or(0) as u32,
+        premium_since: s(&v["premium_since"]),
+        premium_guild_since: s(&v["premium_guild_since"]),
+        joined_at: s(&v["guild_member"]["joined_at"]),
+        nick: s(&v["guild_member"]["nick"]),
+        member_roles: v["guild_member"]["roles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.as_str().map(str::to_string))
+            .collect(),
+        user,
+    })
 }
