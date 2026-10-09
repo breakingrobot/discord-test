@@ -18,6 +18,8 @@ pub struct Channel {
     pub kind: u8,
     #[serde(default)]
     pub position: i32,
+    #[serde(default)]
+    pub recipients: Vec<Author>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,4 +67,17 @@ pub fn send(token: &str, channel: &str, content: &str) -> Result<(), String> {
         .send_json(serde_json::json!({ "content": content }))
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Open DM and group-DM channels, named after their recipients.
+pub fn dms(token: &str) -> Result<Vec<Channel>, String> {
+    let mut chans: Vec<Channel> = get(token, "/users/@me/channels")?;
+    for c in &mut chans {
+        if c.name.is_none() {
+            let names: Vec<_> = c.recipients.iter().map(|r| r.username.as_str()).collect();
+            c.name = Some(names.join(", "));
+        }
+    }
+    chans.sort_by(|a, b| b.id.len().cmp(&a.id.len()).then(b.id.cmp(&a.id)));
+    Ok(chans)
 }

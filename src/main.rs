@@ -9,11 +9,13 @@ use gpui::{
 
 use api::{Channel, Guild, Message};
 
+/// Pseudo guild id for the direct-messages entry.
+const DMS: &str = "@me";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 struct DiscordApp {
     focus: FocusHandle,
-    /// Bot token. Empty until login succeeds.
+    /// User or bot token. Empty until login succeeds.
     token: String,
     logged_in: bool,
     input: String,
@@ -32,7 +34,7 @@ impl DiscordApp {
             token: String::new(),
             logged_in: false,
             input: std::env::var("DISCORD_TOKEN").unwrap_or_default(),
-            status: "Paste a bot token and press Enter (or set DISCORD_TOKEN).".into(),
+            status: "Paste your Discord token and press Enter (or set DISCORD_TOKEN).".into(),
             guilds: vec![],
             channels: vec![],
             messages: vec![],
@@ -104,7 +106,13 @@ impl DiscordApp {
         let token = self.token.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
-                .background_spawn(async move { api::channels(&token, &id) })
+                .background_spawn(async move {
+                    if id == DMS {
+                        api::dms(&token)
+                    } else {
+                        api::channels(&token, &id)
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 match res {
@@ -159,7 +167,10 @@ impl DiscordApp {
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
-            if this.update(cx, |this, cx| this.refresh_messages(cx)).is_err() {
+            if this
+                .update(cx, |this, cx| this.refresh_messages(cx))
+                .is_err()
+            {
                 break;
             }
         })
@@ -204,7 +215,7 @@ impl Render for DiscordApp {
             "•".repeat(self.input.chars().count()).into()
         };
         let placeholder = if !self.logged_in {
-            "Bot token"
+            "User or bot token"
         } else if self.channel.is_some() {
             "Message"
         } else {
@@ -221,20 +232,29 @@ impl Render for DiscordApp {
             .gap_1()
             .flex()
             .flex_col()
-            .children(self.guilds.iter().map(|g| {
-                let id = g.id.clone();
-                let active = self.guild.as_deref() == Some(&g.id);
-                div()
-                    .id(SharedString::from(format!("g-{}", g.id)))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(rgb(0x404249)))
-                    .hover(|d| d.bg(rgb(0x35373c)))
-                    .child(g.name.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx)))
-            }));
+            .children(
+                std::iter::once(Guild {
+                    id: DMS.into(),
+                    name: "Direct Messages".into(),
+                })
+                .chain(self.guilds.iter().cloned())
+                .map(|g| {
+                    let id = g.id.clone();
+                    let active = self.guild.as_deref() == Some(&g.id);
+                    div()
+                        .id(SharedString::from(format!("g-{}", g.id)))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(active, |d| d.bg(rgb(0x404249)))
+                        .hover(|d| d.bg(rgb(0x35373c)))
+                        .child(g.name.clone())
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx)),
+                        )
+                }),
+            );
 
         let channel_list = div()
             .id("channels")
@@ -312,7 +332,9 @@ impl Render for DiscordApp {
                         .child(self.status.clone()),
                 )
             })
-            .when(!self.logged_in || self.channel.is_some(), |d| d.child(input_box));
+            .when(!self.logged_in || self.channel.is_some(), |d| {
+                d.child(input_box)
+            });
 
         div()
             .id("root")
