@@ -600,3 +600,79 @@ pub fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GuildEmoji {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+}
+
+impl GuildEmoji {
+    pub fn url(&self) -> String {
+        format!("https://cdn.discordapp.com/emojis/{}.png?size=48", self.id)
+    }
+
+    /// Markup inserted in the composer.
+    pub fn markup(&self) -> String {
+        format!(
+            "<{}:{}:{}>",
+            if self.animated { "a" } else { "" },
+            self.name,
+            self.id
+        )
+    }
+}
+
+pub fn guild_emojis(token: &str, guild: &str) -> Result<Vec<GuildEmoji>, String> {
+    get(token, &format!("/guilds/{guild}/emojis"))
+}
+
+/// Role id -> name, used to label member-list groups.
+pub fn roles(
+    token: &str,
+    guild: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let v: Vec<Value> = get(token, &format!("/guilds/{guild}/roles"))?;
+    Ok(v.into_iter()
+        .filter_map(|r| {
+            Some((
+                r["id"].as_str()?.to_string(),
+                r["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect())
+}
+
+pub fn pins(token: &str, channel: &str) -> Result<Vec<Message>, String> {
+    let mut msgs: Vec<Message> = get(token, &format!("/channels/{channel}/pins"))?;
+    msgs.sort_by_key(|m| std::cmp::Reverse(m.id.parse::<u64>().unwrap_or(0)));
+    Ok(msgs)
+}
+
+/// Full-text search in a guild (`guild = Some`) or a DM channel.
+pub fn search(
+    token: &str,
+    guild: Option<&str>,
+    channel: &str,
+    query: &str,
+) -> Result<Vec<Message>, String> {
+    let q = percent_encode(query);
+    let path = match guild {
+        Some(g) => format!("/guilds/{g}/messages/search?content={q}"),
+        None => format!("/channels/{channel}/messages/search?content={q}"),
+    };
+    let v: Value = get(token, &path)?;
+    let groups = v["messages"]
+        .as_array()
+        .ok_or("L'index de recherche se prépare, réessayez dans un instant.")?;
+    Ok(groups
+        .iter()
+        .filter_map(|g| {
+            let g = g.as_array()?;
+            let hit = g.iter().find(|m| m["hit"] == true).or(g.first())?;
+            serde_json::from_value(hit.clone()).ok()
+        })
+        .collect())
+}

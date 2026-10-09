@@ -12,7 +12,8 @@ use gpui::{
 };
 
 use crate::api::{Channel, Message, User};
-use crate::{DiscordApp, Field, LoginMode, Picker, QrState};
+use crate::gateway::MemberRow;
+use crate::{DiscordApp, Field, LoginMode, Picker, QrState, Side};
 
 mod color {
     pub const RAIL: u32 = 0x1e1f22;
@@ -339,6 +340,8 @@ impl DiscordApp {
             self.login_view(cx)
         };
         let switcher = self.switcher.is_some().then(|| self.switcher_overlay(cx));
+        let profile = self.profile.clone().map(|u| self.profile_overlay(&u, cx));
+        let settings = self.settings.then(|| self.settings_overlay(cx));
         div()
             .id("root")
             .track_focus(&self.focus)
@@ -348,6 +351,8 @@ impl DiscordApp {
             .text_color(rgb(color::TEXT))
             .text_size(px(15.))
             .child(body)
+            .children(profile)
+            .children(settings)
             .children(switcher)
     }
 
@@ -1111,8 +1116,11 @@ impl DiscordApp {
                     .text_color(rgb(color::MUTED))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
-                    .child("Quitter")
-                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
+                    .child("Réglages")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings = true;
+                        cx.notify();
+                    })),
             )
     }
 
@@ -1165,26 +1173,33 @@ impl DiscordApp {
             })
             .child(div().flex_1())
             .when(self.channel.is_some(), |d| {
-                d.child(
-                    div()
-                        .id("members-toggle")
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.))
-                        .text_sm()
-                        .cursor_pointer()
-                        .text_color(rgb(if self.show_members {
-                            color::BRIGHT
-                        } else {
-                            color::MUTED
-                        }))
-                        .hover(|d| d.bg(rgb(color::HOVER)))
-                        .child("Membres")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_members = !this.show_members;
-                            cx.notify();
-                        })),
-                )
+                let side = self.show_side;
+                d.child(self.header_button(
+                    "pins-btn",
+                    "Épingles",
+                    side && self.side == Side::Pins,
+                    cx,
+                    |t, cx| t.open_pins(cx),
+                ))
+                .child(self.header_button(
+                    "members-btn",
+                    "Membres",
+                    side && self.side == Side::Members,
+                    cx,
+                    |t, cx| t.show_members_panel(cx),
+                ))
+                .child(self.header_button(
+                    "search-btn",
+                    "Rechercher",
+                    side && self.side == Side::Search,
+                    cx,
+                    |t, cx| {
+                        t.search = Some(String::new());
+                        t.side = Side::Search;
+                        t.show_side = true;
+                        cx.notify();
+                    },
+                ))
             });
 
         let body: AnyElement = if self.channel.is_some() {
@@ -1351,8 +1366,8 @@ impl DiscordApp {
                 this.upload(paths.paths().to_vec(), cx)
             }))
             .child(main)
-            .when(self.show_members && self.channel.is_some(), |d| {
-                d.child(self.members_panel())
+            .when(self.show_side && self.channel.is_some(), |d| {
+                d.child(self.side_panel(cx))
             })
             .children(picker)
     }
@@ -1366,6 +1381,38 @@ impl DiscordApp {
             .flex()
             .flex_col()
             .gap_2();
+        if let Some(custom) = self.guild.as_ref().and_then(|g| self.guild_emojis.get(g)) {
+            if !custom.is_empty() {
+                body = body
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(color::MUTED))
+                            .child("CE SERVEUR"),
+                    )
+                    .child(div().flex().flex_wrap().children(custom.iter().map(|e| {
+                        let emoji = e.clone();
+                        let pic: AnyElement = match self.images.get(&e.url()) {
+                            Some(i) => img(i.clone()).size(px(28.)).into_any_element(),
+                            None => div().text_xs().child(e.name.clone()).into_any_element(),
+                        };
+                        div()
+                            .id(SharedString::from(format!("ce-{}", e.id)))
+                            .size(px(36.))
+                            .rounded(px(4.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(color::HOVER)))
+                            .child(pic)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.pick_custom(&emoji, cx)),
+                            )
+                    })));
+            }
+        }
         for (name, list) in crate::emoji::CATEGORIES {
             body = body
                 .child(
@@ -1511,7 +1558,121 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    fn members_panel(&self) -> Stateful<Div> {
+    fn side_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.side {
+            Side::Members => self.members_panel(cx).into_any_element(),
+            Side::Search => self.search_panel(cx).into_any_element(),
+            Side::Pins => self
+                .result_panel(
+                    "MESSAGES ÉPINGLÉS",
+                    &self.pins,
+                    "Aucun message épinglé.",
+                    cx,
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn side_shell(&self, id: &'static str) -> Stateful<Div> {
+        div()
+            .id(id)
+            .w(px(260.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(color::SIDEBAR))
+            .overflow_y_scroll()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+    }
+
+    fn section_label(text: String) -> Div {
+        div()
+            .px_2()
+            .pt_3()
+            .pb_1()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(color::MUTED))
+            .child(text)
+    }
+
+    fn person_row(&self, u: &User, status: Option<&str>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let offline = matches!(status, Some("offline") | Some("invisible"));
+        let dot = status.and_then(|s| match s {
+            "online" => Some(color::GREEN),
+            "idle" => Some(0xf0b232),
+            "dnd" => Some(color::RED),
+            _ => None,
+        });
+        let user = u.clone();
+        div()
+            .id(SharedString::from(format!("p-{}", u.id)))
+            .h(px(42.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .when(offline, |d| d.opacity(0.5))
+            .hover(|d| d.bg(rgb(color::HOVER)))
+            .child(
+                div()
+                    .relative()
+                    .child(self.avatar(u, 32.))
+                    .children(dot.map(|c| {
+                        div()
+                            .absolute()
+                            .right(px(-2.))
+                            .bottom(px(-2.))
+                            .size(px(12.))
+                            .rounded_full()
+                            .bg(rgb(c))
+                            .border_2()
+                            .border_color(rgb(color::SIDEBAR))
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_color(rgb(color::MUTED))
+                    .child(u.display_name().to_string()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.profile = Some(user.clone());
+                cx.notify();
+            }))
+    }
+
+    fn members_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut panel = self.side_shell("members");
+        let in_guild = self.channel.as_ref().is_some_and(|c| !c.is_dm());
+        if in_guild && !self.members.is_empty() {
+            for row in &self.members {
+                match row {
+                    MemberRow::Group { id, count } => {
+                        let name = match id.as_str() {
+                            "online" => "EN LIGNE".to_string(),
+                            "offline" => "HORS LIGNE".to_string(),
+                            other => self
+                                .roles
+                                .get(other)
+                                .map(|r| r.to_uppercase())
+                                .unwrap_or_else(|| "RÔLE".into()),
+                        };
+                        panel = panel.child(Self::section_label(format!("{name} — {count}")));
+                    }
+                    MemberRow::Member { user, status } => {
+                        panel = panel.child(self.person_row(user, Some(status), cx));
+                    }
+                }
+            }
+            return panel;
+        }
+        // Fallback: DM participants / recent authors.
         let mut people: Vec<User> = Vec::new();
         let mut label = "PARTICIPANTS RÉCENTS";
         if let Some(c) = &self.channel {
@@ -1527,45 +1688,415 @@ impl DiscordApp {
                 }
             }
         }
-        div()
-            .id("members")
-            .w(px(240.))
-            .h_full()
-            .flex_shrink_0()
-            .bg(rgb(color::SIDEBAR))
-            .overflow_y_scroll()
-            .p_2()
+        panel = panel.child(Self::section_label(format!("{label} — {}", people.len())));
+        for u in &people {
+            panel = panel.child(self.person_row(u, None, cx));
+        }
+        panel
+    }
+
+    fn search_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let focused = self.search.is_some();
+        let query = self.search.clone().unwrap_or_default();
+        let input = div()
+            .id("search-box")
+            .h(px(34.))
+            .px_3()
+            .mb_2()
+            .rounded(px(4.))
+            .bg(rgb(color::RAIL))
+            .border_1()
+            .border_color(rgb(if focused { color::BRAND } else { color::RAIL }))
             .flex()
-            .flex_col()
-            .gap(px(2.))
-            .child(
+            .items_center()
+            .cursor_text()
+            .overflow_hidden()
+            .child(if focused {
                 div()
-                    .px_2()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::MUTED))
-                    .child(format!("{label} — {}", people.len())),
-            )
-            .children(people.iter().map(|u| {
-                div()
-                    .h(px(42.))
-                    .px_2()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .rounded(px(4.))
-                    .hover(|d| d.bg(rgb(color::HOVER)))
-                    .child(self.avatar(u, 32.))
+                    .child(query)
+                    .child(Self::caret())
+            } else {
+                div()
+                    .text_color(rgb(color::MUTED))
+                    .child("Rechercher (Entrée pour lancer)")
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.search.is_none() {
+                    this.search = Some(String::new());
+                }
+                cx.notify();
+            }));
+        let mut panel = self
+            .side_shell("search")
+            .child(Self::section_label("RECHERCHE".into()))
+            .child(input);
+        if !self.search_note.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_sm()
+                    .text_color(rgb(color::MUTED))
+                    .child(self.search_note.clone()),
+            );
+        }
+        for m in &self.search_results {
+            panel = panel.child(self.result_row(m));
+        }
+        panel
+    }
+
+    fn result_panel(
+        &self,
+        title: &str,
+        msgs: &[Message],
+        empty: &str,
+        _cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let mut panel = self
+            .side_shell("results")
+            .child(Self::section_label(format!("{title} — {}", msgs.len())));
+        if msgs.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_sm()
+                    .text_color(rgb(color::MUTED))
+                    .child(empty.to_string()),
+            );
+        }
+        for m in msgs {
+            panel = panel.child(self.result_row(m));
+        }
+        panel
+    }
+
+    fn result_row(&self, m: &Message) -> Div {
+        let when = parse_time(&m.timestamp)
+            .map(|t| stamp(&t))
+            .unwrap_or_default();
+        let (text, _) = markdown(&m.content, false);
+        let text: String = text.chars().take(240).collect();
+        div()
+            .mb_1()
+            .p_2()
+            .rounded(px(4.))
+            .bg(rgb(color::CHAT))
+            .flex()
+            .gap_2()
+            .child(self.avatar(&m.author, 28.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_color(rgb(color::MUTED))
-                            .child(u.display_name().to_string()),
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(color::BRIGHT))
+                                    .child(m.author.display_name().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(color::MUTED))
+                                    .child(when),
+                            ),
                     )
+                    .child(div().text_sm().child(if text.is_empty() {
+                        "(pièce jointe)".to_string()
+                    } else {
+                        text
+                    })),
+            )
+    }
+
+    fn header_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        active: bool,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .text_sm()
+            .cursor_pointer()
+            .text_color(rgb(if active { color::BRIGHT } else { color::MUTED }))
+            .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| on(this, cx)))
+    }
+
+    fn profile_overlay(&self, user: &User, cx: &mut Context<Self>) -> AnyElement {
+        let u = user.clone();
+        let (u2, id) = (user.clone(), user.id.clone());
+        let is_me = self.me.as_ref().is_some_and(|m| m.id == user.id);
+        let button = |label: &'static str, id: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .h(px(36.))
+                .px_4()
+                .rounded(px(3.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(rgb(0xffffff))
+                .bg(rgb(if primary { color::BRAND } else { color::ACTIVE }))
+                .child(label)
+        };
+        div()
+            .id("profile-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0x000000a0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.profile = None;
+                cx.notify();
             }))
+            .child(
+                div()
+                    .id("profile")
+                    .w(px(360.))
+                    .rounded(px(8.))
+                    .bg(rgb(color::SIDEBAR))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(div().h(px(80.)).bg(rgb(color::BRAND)))
+                    .child(
+                        div()
+                            .px_4()
+                            .pb_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .mt(px(-40.))
+                                    .size(px(88.))
+                                    .rounded_full()
+                                    .border_4()
+                                    .border_color(rgb(color::SIDEBAR))
+                                    .child(self.avatar(&u, 80.)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(20.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(color::BRIGHT))
+                                            .child(u.display_name().to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(color::MUTED))
+                                            .child(u.username.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(color::MUTED))
+                                    .child(format!("ID : {}", u.id)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .when(!is_me, |d| {
+                                        d.child(
+                                            button("Envoyer un message", "profile-dm", true)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.profile = None;
+                                                    if this.guild.is_some() {
+                                                        this.guild = None;
+                                                        this.channels.clear();
+                                                    }
+                                                    this.open_dm_with(&u2, cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(button("Copier l'ID", "profile-copy", false).on_click(
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                id.clone(),
+                                            ))
+                                        }),
+                                    )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn settings_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let me = self.me.clone().unwrap_or_default();
+        let toggle = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .h(px(40.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .child(label)
+                .child(
+                    div()
+                        .w(px(40.))
+                        .h(px(22.))
+                        .rounded_full()
+                        .bg(rgb(if on { color::GREEN } else { color::MUTED }))
+                        .flex()
+                        .items_center()
+                        .when(on, |d| d.justify_end())
+                        .px(px(3.))
+                        .child(div().size(px(16.)).rounded_full().bg(rgb(0xffffff))),
+                )
+        };
+        div()
+            .id("settings-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0x000000a0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.settings = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("settings")
+                    .w(px(480.))
+                    .rounded(px(8.))
+                    .bg(rgb(color::CHAT))
+                    .shadow_lg()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(color::BRIGHT))
+                            .child("Paramètres utilisateur"),
+                    )
+                    .child(Self::section_label("MON COMPTE".into()))
+                    .child(
+                        div()
+                            .p_3()
+                            .rounded(px(8.))
+                            .bg(rgb(color::SIDEBAR))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(self.avatar(&me, 48.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(color::BRIGHT))
+                                            .child(me.display_name().to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(color::MUTED))
+                                            .child(me.username.clone()),
+                                    ),
+                            ),
+                    )
+                    .child(Self::section_label("APPLICATION".into()))
+                    .child(
+                        toggle("set-side", "Afficher le panneau latéral", self.show_side).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.show_side = !this.show_side;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        toggle(
+                            "set-title",
+                            "Afficher les mentions dans le titre de la fenêtre",
+                            self.title_badge,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.title_badge = !this.title_badge;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("set-logout")
+                                    .h(px(36.))
+                                    .px_4()
+                                    .rounded(px(3.))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .bg(rgb(color::RED))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .child("Se déconnecter")
+                                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("set-close")
+                                    .h(px(36.))
+                                    .px_4()
+                                    .rounded(px(3.))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .bg(rgb(color::ACTIVE))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .child("Fermer")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn welcome(&self, prefix: &str, title: &str) -> Div {
@@ -1967,6 +2498,7 @@ impl DiscordApp {
             text = text.child(self.reactions(m, cx));
         }
 
+        let author = m.author.clone();
         let gutter = if grouped {
             div()
                 .w(px(40.))
@@ -1980,7 +2512,16 @@ impl DiscordApp {
                 .child(time.map(hhmm).unwrap_or_default())
                 .into_any_element()
         } else {
-            self.avatar(&m.author, 40.)
+            let a = author.clone();
+            div()
+                .id(SharedString::from(format!("av-{}", m.id)))
+                .cursor_pointer()
+                .child(self.avatar(&m.author, 40.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.profile = Some(a.clone());
+                    cx.notify();
+                }))
+                .into_any_element()
         };
 
         let pinged = m.mention_everyone

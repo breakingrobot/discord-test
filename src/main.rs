@@ -17,7 +17,7 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 
-use api::{Channel, Emoji, Guild, Message, User};
+use api::{Channel, Emoji, Guild, GuildEmoji, Message, User};
 
 /// REST polling happens only while the gateway is down.
 const POLL_FAST: Duration = Duration::from_secs(4);
@@ -50,6 +50,13 @@ pub enum QrState {
 pub struct Unread {
     pub guild: Option<String>,
     pub mentions: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Members,
+    Search,
+    Pins,
 }
 
 pub enum Picker {
@@ -86,7 +93,22 @@ pub struct DiscordApp {
     channel: Option<Channel>,
     collapsed: HashSet<String>,
     last_msg_id: Option<String>,
-    show_members: bool,
+    show_side: bool,
+    side: Side,
+    /// Query being typed in the search box (`Some` = search input has focus).
+    search: Option<String>,
+    search_results: Vec<Message>,
+    search_note: String,
+    pins: Vec<Message>,
+    members: Vec<gateway::MemberRow>,
+    roles: HashMap<String, String>,
+    guild_emojis: HashMap<String, Vec<GuildEmoji>>,
+    profile: Option<User>,
+    settings: bool,
+    title_badge: bool,
+    last_title: String,
+    gateway_cmd: Option<flume::Sender<gateway::Command>>,
+    last_member_req: Option<Instant>,
     loading_older: bool,
     /// True once the oldest message of the channel has been loaded.
     history_done: bool,
@@ -157,7 +179,21 @@ impl DiscordApp {
             channel: None,
             collapsed: HashSet::new(),
             last_msg_id: None,
-            show_members: true,
+            show_side: true,
+            side: Side::Members,
+            search: None,
+            search_results: vec![],
+            search_note: String::new(),
+            pins: vec![],
+            members: vec![],
+            roles: HashMap::new(),
+            guild_emojis: HashMap::new(),
+            profile: None,
+            settings: false,
+            title_badge: true,
+            last_title: String::new(),
+            gateway_cmd: None,
+            last_member_req: None,
             loading_older: false,
             history_done: false,
             replying: None,
@@ -247,8 +283,25 @@ impl DiscordApp {
             self.picker = None;
             return cx.notify();
         }
+        if ks.key == "escape" && (self.profile.is_some() || self.settings) {
+            self.profile = None;
+            self.settings = false;
+            return cx.notify();
+        }
+        if self.logged_in && cmd && ks.key == "f" {
+            self.search = match self.search {
+                Some(_) => None,
+                None => Some(String::new()),
+            };
+            self.side = Side::Search;
+            self.show_side = true;
+            return cx.notify();
+        }
         if self.switcher.is_some() {
             return self.on_switcher_key(ev, cx);
+        }
+        if self.search.is_some() {
+            return self.on_search_key(ev, cx);
         }
         let len = self.input.chars().count();
         let before = self.input.len();
@@ -506,6 +559,153 @@ impl DiscordApp {
                     self.switcher_sel = 0;
                 }
             }
+        }
+        cx.notify();
+    }
+
+    fn on_search_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => self.search = None,
+            "backspace" => {
+                if let Some(q) = &mut self.search {
+                    q.pop();
+                }
+            }
+            "enter" => self.run_search(cx),
+            _ => {
+                if ks.modifiers.control || ks.modifiers.platform {
+                    return;
+                }
+                if let (Some(ch), Some(q)) = (&ks.key_char, &mut self.search) {
+                    q.push_str(ch);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let (Some(query), Some(channel)) = (self.search.clone(), self.channel.clone()) else {
+            return;
+        };
+        if query.trim().is_empty() {
+            return;
+        }
+        let (auth, guild) = (self.auth.clone(), self.guild.clone());
+        self.search_note = "Recherche…".into();
+        self.search_results.clear();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    api::search(&auth, guild.as_deref(), &channel.id, query.trim())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(r) => {
+                        this.search_note = if r.is_empty() {
+                            "Aucun résultat.".into()
+                        } else {
+                            String::new()
+                        };
+                        this.search_results = r;
+                    }
+                    Err(e) => this.search_note = e,
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn open_pins(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        self.side = Side::Pins;
+        self.show_side = true;
+        self.pins.clear();
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::pins(&auth, &channel.id) })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(p) => this.pins = p,
+                    Err(e) => this.status = format!("Épingles indisponibles : {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn show_members_panel(&mut self, cx: &mut Context<Self>) {
+        if self.show_side && self.side == Side::Members {
+            self.show_side = false;
+        } else {
+            self.side = Side::Members;
+            self.show_side = true;
+            self.request_members(cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the gateway for the guild's member list (with presence). User accounts only.
+    fn request_members(&mut self, cx: &mut Context<Self>) {
+        let (Some(guild), Some(channel), Some(tx)) = (
+            self.guild.clone(),
+            self.channel.clone(),
+            self.gateway_cmd.clone(),
+        ) else {
+            return;
+        };
+        if self
+            .last_member_req
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(4))
+        {
+            return;
+        }
+        self.last_member_req = Some(Instant::now());
+        let _ = tx.send(gateway::Command::RequestMembers {
+            guild_id: guild.clone(),
+            channel_id: channel.id,
+        });
+        if !self.roles.is_empty() || self.auth.starts_with("Bot ") {
+            return;
+        }
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(r) = cx
+                .background_spawn(async move { api::roles(&auth, &guild) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.roles.extend(r);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn pick_custom(&mut self, e: &GuildEmoji, cx: &mut Context<Self>) {
+        match self.picker.take() {
+            Some(Picker::React(m)) => {
+                let emoji = Emoji {
+                    id: Some(e.id.clone()),
+                    name: Some(e.name.clone()),
+                };
+                self.toggle_reaction(&m, &emoji, false, cx);
+            }
+            Some(Picker::Composer) => self.insert(&e.markup()),
+            None => {}
         }
         cx.notify();
     }
@@ -881,6 +1081,11 @@ impl DiscordApp {
         self.clear_input();
         self.status.clear();
         self.unread.clear();
+        self.members.clear();
+        self.gateway_cmd = None;
+        self.settings = false;
+        self.profile = None;
+        self.search = None;
         self.friends.clear();
         self.picker = None;
         self.switcher = None;
@@ -893,7 +1098,11 @@ impl DiscordApp {
 
     fn start_gateway(&mut self, cx: &mut Context<Self>) {
         let (tx, rx) = flume::unbounded();
-        gateway::spawn(self.auth.clone(), tx, self.gateway_stop.clone());
+        self.gateway_cmd = Some(gateway::spawn(
+            self.auth.clone(),
+            tx,
+            self.gateway_stop.clone(),
+        ));
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv_async().await {
                 if this.update(cx, |this, cx| this.on_gateway(ev, cx)).is_err() {
@@ -907,7 +1116,23 @@ impl DiscordApp {
     fn on_gateway(&mut self, ev: gateway::Event, cx: &mut Context<Self>) {
         use gateway::Event::*;
         match ev {
-            Connected(up) => self.connected = up,
+            Connected(up) => {
+                self.connected = up;
+                if up {
+                    self.last_member_req = None;
+                    self.request_members(cx);
+                }
+            }
+            Members { guild_id, rows } => {
+                if self.guild.as_deref() == Some(&guild_id) {
+                    self.members = rows;
+                }
+            }
+            MembersStale { guild_id } => {
+                if self.guild.as_deref() == Some(&guild_id) {
+                    self.request_members(cx);
+                }
+            }
             MessageCreate(m) => {
                 self.learn_users(std::slice::from_ref(&m));
                 self.typing
@@ -1060,8 +1285,26 @@ impl DiscordApp {
     fn select_guild(&mut self, id: String, cx: &mut Context<Self>) {
         self.guild = Some(id.clone());
         self.channels.clear();
+        self.members.clear();
         self.reset_channel();
         let auth = self.auth.clone();
+        if !self.guild_emojis.contains_key(&id) {
+            let (a, g) = (auth.clone(), id.clone());
+            cx.spawn(async move |this, cx| {
+                let g2 = g.clone();
+                if let Ok(e) = cx
+                    .background_spawn(async move { api::guild_emojis(&a, &g2) })
+                    .await
+                {
+                    this.update(cx, |this, cx| {
+                        this.guild_emojis.insert(g, e);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let gid = id.clone();
             let res = cx
@@ -1093,7 +1336,15 @@ impl DiscordApp {
         self.unread.remove(&channel.id);
         self.channel = Some(channel);
         self.status.clear();
+        self.search = None;
+        self.search_results.clear();
+        self.search_note.clear();
         self.refresh_messages(cx);
+        if self.side == Side::Pins && self.show_side {
+            self.open_pins(cx);
+        }
+        self.last_member_req = None;
+        self.request_members(cx);
         cx.notify();
     }
 
@@ -1163,7 +1414,28 @@ impl DiscordApp {
                 .flat_map(|c| &c.recipients)
                 .filter_map(|u| u.avatar_url()),
         );
-        for m in &self.messages {
+        if self.picker.is_some() {
+            if let Some(g) = &self.guild {
+                wanted.extend(
+                    self.guild_emojis
+                        .get(g)
+                        .into_iter()
+                        .flatten()
+                        .map(|e| e.url()),
+                );
+            }
+        }
+        for row in &self.members {
+            if let gateway::MemberRow::Member { user, .. } = row {
+                wanted.extend(user.avatar_url());
+            }
+        }
+        for m in self
+            .messages
+            .iter()
+            .chain(&self.search_results)
+            .chain(&self.pins)
+        {
             wanted.extend(m.author.avatar_url());
             if let Some(r) = &m.referenced_message {
                 wanted.extend(r.author.avatar_url());
@@ -1248,6 +1520,16 @@ impl Render for DiscordApp {
             window.focus(&self.focus);
         }
         self.ensure_images(cx);
+        let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
+        let title = if self.title_badge && mentions > 0 {
+            format!("({mentions}) Discord")
+        } else {
+            "Discord".to_string()
+        };
+        if title != self.last_title {
+            window.set_window_title(&title);
+            self.last_title = title;
+        }
         self.root(cx)
     }
 }

@@ -13,14 +13,38 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::{client, Message as Ws};
 
-use crate::api::{self, Message};
+use crate::api::{self, Message, User};
 
 const DEFAULT_URL: &str = "wss://gateway.discord.gg/?v=9&encoding=json";
 
 pub type Socket = tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
+/// Commands from the UI to the gateway thread.
+#[derive(Debug)]
+pub enum Command {
+    /// Subscribe to a guild's member list (user accounts only).
+    RequestMembers {
+        guild_id: String,
+        channel_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum MemberRow {
+    Group { id: String, count: u64 },
+    Member { user: User, status: String },
+}
+
 #[derive(Debug)]
 pub enum Event {
+    Members {
+        guild_id: String,
+        rows: Vec<MemberRow>,
+    },
+    /// The member list changed in a way we don't patch incrementally.
+    MembersStale {
+        guild_id: String,
+    },
     MessageCreate(Message),
     /// A message changed (edit, reaction, embed resolved) in this channel.
     ChannelChanged(String),
@@ -91,13 +115,18 @@ struct Session {
 }
 
 /// Spawns the gateway thread. It stops once `stop` is set or the receiver is dropped.
-pub fn spawn(auth: String, tx: flume::Sender<Event>, stop: Arc<AtomicBool>) {
+pub fn spawn(
+    auth: String,
+    tx: flume::Sender<Event>,
+    stop: Arc<AtomicBool>,
+) -> flume::Sender<Command> {
+    let (cmd_tx, cmd_rx) = flume::unbounded();
     std::thread::spawn(move || {
         let mut session = Session::default();
         let mut failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
             let started = Instant::now();
-            let _ = run(&auth, &tx, &stop, &mut session);
+            let _ = run(&auth, &tx, &cmd_rx, &stop, &mut session);
             if tx.send(Event::Connected(false)).is_err() {
                 return;
             }
@@ -116,6 +145,7 @@ pub fn spawn(auth: String, tx: flume::Sender<Event>, stop: Arc<AtomicBool>) {
             }
         }
     });
+    cmd_tx
 }
 
 fn identify(auth: &str) -> Value {
@@ -141,6 +171,7 @@ fn identify(auth: &str) -> Value {
 fn run(
     auth: &str,
     tx: &flume::Sender<Event>,
+    cmds: &flume::Receiver<Command>,
     stop: &AtomicBool,
     session: &mut Session,
 ) -> Result<(), String> {
@@ -160,6 +191,21 @@ fn run(
             ws.send(Ws::text(json!({ "op": 1, "d": session.seq }).to_string()))
                 .map_err(|e| e.to_string())?;
             next_beat = Instant::now() + interval;
+        }
+        while let Ok(cmd) = cmds.try_recv() {
+            let Command::RequestMembers {
+                guild_id,
+                channel_id,
+            } = cmd;
+            if session.id.is_some() && !auth.starts_with("Bot ") {
+                let msg = json!({ "op": 14, "d": {
+                    "guild_id": guild_id,
+                    "typing": true, "activities": true, "threads": true,
+                    "channels": { channel_id: [[0, 99]] },
+                }});
+                ws.send(Ws::text(msg.to_string()))
+                    .map_err(|e| e.to_string())?;
+            }
         }
         let v = match read_json(&mut ws) {
             Ok(Some(v)) => v,
@@ -234,6 +280,43 @@ fn dispatch(kind: &str, d: &Value) -> Option<Event> {
             channel_id: s("channel_id"),
             id: s("id"),
         }),
+        "GUILD_MEMBER_LIST_UPDATE" => {
+            let guild_id = s("guild_id");
+            let mut rows = Vec::new();
+            let mut synced = false;
+            for op in d["ops"].as_array().into_iter().flatten() {
+                if op["op"] == "SYNC" {
+                    synced = true;
+                    for item in op["items"].as_array().into_iter().flatten() {
+                        if let Some(gr) = item.get("group") {
+                            rows.push(MemberRow::Group {
+                                id: gr["id"].as_str().unwrap_or_default().to_string(),
+                                count: gr["count"].as_u64().unwrap_or(0),
+                            });
+                        } else if let Some(m) = item.get("member") {
+                            if let Ok(mut user) = serde_json::from_value::<User>(m["user"].clone())
+                            {
+                                if let Some(nick) = m["nick"].as_str() {
+                                    user.global_name = Some(nick.to_string());
+                                }
+                                rows.push(MemberRow::Member {
+                                    user,
+                                    status: m["presence"]["status"]
+                                        .as_str()
+                                        .unwrap_or("offline")
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Some(if synced {
+                Event::Members { guild_id, rows }
+            } else {
+                Event::MembersStale { guild_id }
+            })
+        }
         "TYPING_START" => Some(Event::Typing {
             channel_id: s("channel_id"),
             user_id: s("user_id"),

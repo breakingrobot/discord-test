@@ -17,8 +17,11 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
   copy, upload files (button or drag & drop), emoji picker, Ctrl+K quick switcher.
 - Composer is a live Markdown editor: **bold**, *italic*, __underline__, ~~strike~~, `code`, links are styled as you type.
   Ctrl+B / Ctrl+I / Ctrl+U / Ctrl+E / Ctrl+Shift+X insert markers, Shift+Enter adds a new line, Ctrl+V pastes.
-- Not implemented: voice, full server member list, custom/server emoji picker, threads, search, settings,
-  presence of friends, notifications.
+- Search (Ctrl+F or "Rechercher"), pinned messages, real server member list with presence and role groups
+  (via the gateway's member-list subscription, user accounts only), server custom emojis in the picker,
+  profile popup (click an avatar or member), settings panel, mention count in the window title.
+- Not implemented: voice, threads, forum channels, desktop notifications, friend presence, role colours,
+  GIF picker, slash commands, light theme.
 - Using a user account with a third-party client is against Discord's Terms of Service (account risk is yours).
   QR and password login follow community-documented protocols and have not been verified against Discord here.
 
