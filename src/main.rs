@@ -761,7 +761,7 @@ impl DiscordApp {
     }
 
     /// Asks the gateway for the guild's member list (with presence). User accounts only.
-    fn request_members(&mut self, cx: &mut Context<Self>) {
+    fn request_members(&mut self, _cx: &mut Context<Self>) {
         let (Some(guild), Some(channel), Some(tx)) = (
             self.guild.clone(),
             self.channel.clone(),

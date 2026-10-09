@@ -1165,7 +1165,7 @@ impl DiscordApp {
         self.threads
             .iter()
             .filter(|t| t.parent_id.as_deref() == Some(parent))
-            .filter(|t| !self.channels.iter().any(|c| c.id == parent && c.is_forum()))
+            .filter(|_| !self.channels.iter().any(|c| c.id == parent && c.is_forum()))
             .map(|t| {
                 let chan = t.clone();
                 let active = self.channel.as_ref().map(|s| &s.id) == Some(&t.id);
