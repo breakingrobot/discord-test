@@ -1,12 +1,16 @@
 //! Discord-style layout: server rail, channel sidebar, chat pane, login screen.
 
 use chrono::{DateTime, Datelike, Local, Timelike};
+use std::ops::Range;
+use std::sync::Arc;
+
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, Div, FontWeight, KeyDownEvent, SharedString,
-    Stateful,
+    div, img, prelude::*, px, rgb, AnyElement, Context, Div, FontStyle, FontWeight, HighlightStyle,
+    Image, KeyDownEvent, ObjectFit, SharedString, Stateful, StrikethroughStyle, StyledImage,
+    StyledText, UnderlineStyle,
 };
 
-use crate::api::{Channel, Message};
+use crate::api::{Channel, Message, User};
 use crate::DiscordApp;
 
 mod color {
@@ -67,7 +71,7 @@ fn stamp(t: &DateTime<Local>) -> String {
     }
 }
 
-fn avatar(user_id: &str, name: &str, size: f32) -> Div {
+fn initials_avatar(user_id: &str, name: &str, size: f32) -> Div {
     let hash = user_id
         .bytes()
         .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
@@ -89,6 +93,143 @@ fn avatar(user_id: &str, name: &str, size: f32) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_size(px(size * 0.42))
         .child(initial)
+}
+
+fn round_image(image: Arc<Image>, size: f32, radius: Option<f32>) -> AnyElement {
+    let el = img(image)
+        .size(px(size))
+        .flex_shrink_0()
+        .object_fit(ObjectFit::Cover);
+    match radius {
+        Some(r) => el.rounded(px(r)).into_any_element(),
+        None => el.rounded_full().into_any_element(),
+    }
+}
+
+/// Resolves `<@id>`, `<#id>`, `<:emoji:id>` style tokens into readable text.
+fn resolve_tokens(src: &str, lookup: &dyn Fn(char, &str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find('>') else {
+            out.push_str(tail);
+            return out;
+        };
+        let inner = &tail[1..end];
+        let replaced = if let Some(id) = inner.strip_prefix("@&") {
+            Some(lookup('&', id).unwrap_or_else(|| "@rôle".into()))
+        } else if let Some(id) = inner.strip_prefix("@!").or_else(|| inner.strip_prefix('@')) {
+            Some(lookup('@', id).unwrap_or_else(|| "@utilisateur".into()))
+        } else if let Some(id) = inner.strip_prefix('#') {
+            Some(lookup('#', id).unwrap_or_else(|| "#salon".into()))
+        } else {
+            let e = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
+            e.and_then(|e| e.split(':').next())
+                .map(|n| format!(":{n}:"))
+        };
+        match replaced {
+            Some(r) => out.push_str(&r),
+            None => out.push_str(&tail[..=end]),
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Tiny Markdown subset: **bold**, *italic*, __underline__, ~~strike~~, `code`, ```blocks```, links.
+/// With `keep_markers` the output equals `src` (live styling for the composer).
+fn markdown(src: &str, keep_markers: bool) -> (String, Vec<(Range<usize>, HighlightStyle)>) {
+    let bold = HighlightStyle {
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    let italic = HighlightStyle {
+        font_style: Some(FontStyle::Italic),
+        ..Default::default()
+    };
+    let code = HighlightStyle {
+        background_color: Some(rgb(0x1e1f22).into()),
+        ..Default::default()
+    };
+    let under = HighlightStyle {
+        underline: Some(UnderlineStyle {
+            thickness: px(1.),
+            color: None,
+            wavy: false,
+        }),
+        ..Default::default()
+    };
+    let strike = HighlightStyle {
+        strikethrough: Some(StrikethroughStyle {
+            thickness: px(1.),
+            color: None,
+        }),
+        ..Default::default()
+    };
+    let link = HighlightStyle {
+        color: Some(rgb(color::LINK).into()),
+        underline: Some(UnderlineStyle {
+            thickness: px(1.),
+            color: None,
+            wavy: false,
+        }),
+        ..Default::default()
+    };
+    let markers: [(&str, HighlightStyle); 7] = [
+        ("```", code),
+        ("**", bold),
+        ("__", under),
+        ("~~", strike),
+        ("`", code),
+        ("*", italic),
+        ("_", italic),
+    ];
+
+    let mut out = String::new();
+    let mut hl: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut rest = src;
+    'outer: while !rest.is_empty() {
+        for (m, style) in &markers {
+            if !rest.starts_with(m) {
+                continue;
+            }
+            if *m == "_" && out.chars().last().is_some_and(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            let body = &rest[m.len()..];
+            if let Some(end) = body.find(m) {
+                let inner = &body[..end];
+                if end > 0 && !inner.starts_with(char::is_whitespace) {
+                    let start = out.len();
+                    if keep_markers {
+                        out.push_str(m);
+                    }
+                    out.push_str(inner);
+                    if keep_markers {
+                        out.push_str(m);
+                    }
+                    hl.push((start..out.len(), *style));
+                    rest = &body[end + m.len()..];
+                    continue 'outer;
+                }
+            }
+        }
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let start = out.len();
+            out.push_str(&rest[..end]);
+            hl.push((start..out.len(), link));
+            rest = &rest[end..];
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (out, hl)
 }
 
 fn acronym(name: &str) -> String {
@@ -119,14 +260,19 @@ fn rail_slot(button: Stateful<Div>, active: bool) -> Div {
         .child(button)
 }
 
-fn rail_button(id: impl Into<SharedString>, active: bool, label: String) -> Stateful<Div> {
-    div()
-        .id(id.into())
-        .size(px(48.))
-        .flex()
+fn rail_button(
+    id: impl Into<SharedString>,
+    active: bool,
+    label: String,
+    icon: Option<Arc<Image>>,
+) -> Stateful<Div> {
+    let base = div().id(id.into()).size(px(48.)).cursor_pointer();
+    if let Some(icon) = icon {
+        return base.child(round_image(icon, 48., Some(if active { 16. } else { 24. })));
+    }
+    base.flex()
         .items_center()
         .justify_center()
-        .cursor_pointer()
         .text_color(rgb(color::BRIGHT))
         .font_weight(FontWeight::SEMIBOLD)
         .text_size(px(15.))
@@ -163,7 +309,20 @@ impl DiscordApp {
 
     // ---- text input ----------------------------------------------------
 
-    /// The editable line with a caret. `mask` hides the text (token entry).
+    // ---- text input ----------------------------------------------------
+
+    fn avatar(&self, u: &User, size: f32) -> AnyElement {
+        match u
+            .avatar_url()
+            .and_then(|url| self.images.get(&url).cloned())
+        {
+            Some(i) => round_image(i, size, None),
+            None => initials_avatar(&u.id, u.display_name(), size).into_any_element(),
+        }
+    }
+
+    /// The editable text with a caret. `mask` hides the text (token entry);
+    /// otherwise Markdown is styled live and newlines start new rows.
     fn input_line(&self, placeholder: String, mask: bool) -> Div {
         if self.input.is_empty() {
             return div()
@@ -172,20 +331,60 @@ impl DiscordApp {
                 .child(Self::caret())
                 .child(div().text_color(rgb(color::MUTED)).child(placeholder));
         }
-        let shown: Vec<char> = if mask {
-            self.input.chars().map(|_| '•').collect()
+        let text: String = if mask {
+            self.input
+                .chars()
+                .map(|c| if c == '\n' { c } else { '•' })
+                .collect()
         } else {
-            self.input.chars().collect()
+            self.input.clone()
         };
-        let at = self.cursor.min(shown.len());
-        let before: String = shown[..at].iter().collect();
-        let after: String = shown[at..].iter().collect();
-        div()
-            .flex()
-            .items_center()
-            .child(before)
-            .child(Self::caret())
-            .child(after)
+        let hl = if mask {
+            vec![]
+        } else {
+            markdown(&text, true).1
+        };
+        let caret_byte = text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+
+        let mut col = div().flex().flex_col();
+        let mut offset = 0;
+        let mut caret_placed = false;
+        for line in text.split('\n') {
+            let (start, end) = (offset, offset + line.len());
+            offset = end + 1;
+            if !caret_placed && caret_byte <= end {
+                caret_placed = true;
+                let c = caret_byte - start;
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(Self::styled(&line[..c], slice_hl(&hl, start, start + c)))
+                        .child(Self::caret())
+                        .child(Self::styled(&line[c..], slice_hl(&hl, start + c, end))),
+                );
+            } else {
+                col = col.child(
+                    div()
+                        .min_h(px(22.))
+                        .child(Self::styled(line, slice_hl(&hl, start, end))),
+                );
+            }
+        }
+        col
+    }
+
+    fn styled(text: &str, hl: Vec<(Range<usize>, HighlightStyle)>) -> AnyElement {
+        if text.is_empty() {
+            return div().into_any_element();
+        }
+        StyledText::new(text.to_string())
+            .with_highlights(hl)
+            .into_any_element()
     }
 
     fn caret() -> Div {
@@ -281,16 +480,18 @@ impl DiscordApp {
     // ---- server rail ---------------------------------------------------
 
     fn rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let home_active = self.guild.is_none();
         let home = rail_slot(
-            rail_button("home", self.guild.is_none(), "DM".into())
+            rail_button("home", home_active, "DM".into(), None)
                 .on_click(cx.listener(|this, _, _, cx| this.open_home(cx))),
-            self.guild.is_none(),
+            home_active,
         );
         let guilds = self.guilds.iter().map(|g| {
             let active = self.guild.as_deref() == Some(&g.id);
             let id = g.id.clone();
+            let icon = g.icon_url().and_then(|u| self.images.get(&u).cloned());
             rail_slot(
-                rail_button(format!("g-{}", g.id), active, acronym(&g.name))
+                rail_button(format!("g-{}", g.id), active, acronym(&g.name), icon)
                     .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx))),
                 active,
             )
@@ -368,7 +569,7 @@ impl DiscordApp {
                     .gap(px(2.))
                     .children(rows),
             )
-            .child(self.user_panel())
+            .child(self.user_panel(cx))
     }
 
     fn dm_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -384,11 +585,10 @@ impl DiscordApp {
             let active = self.channel.as_ref().map(|s| &s.id) == Some(&c.id);
             let chan = c.clone();
             let title = c.title();
-            let uid = c
-                .recipients
-                .first()
-                .map(|r| r.id.clone())
-                .unwrap_or_else(|| c.id.clone());
+            let pic = match c.recipients.first() {
+                Some(u) => self.avatar(u, 32.),
+                None => initials_avatar(&c.id, &title, 32.).into_any_element(),
+            };
             rows.push(
                 div()
                     .id(SharedString::from(format!("dm-{}", c.id)))
@@ -402,7 +602,7 @@ impl DiscordApp {
                     .text_color(rgb(if active { color::BRIGHT } else { color::MUTED }))
                     .when(active, |d| d.bg(rgb(color::ACTIVE)))
                     .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
-                    .child(avatar(&uid, &title, 32.))
+                    .child(pic)
                     .child(div().flex_1().overflow_hidden().child(title))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
@@ -484,15 +684,8 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    fn user_panel(&self) -> Div {
-        let (id, name, handle) = match &self.me {
-            Some(u) => (
-                u.id.clone(),
-                u.display_name().to_string(),
-                u.username.clone(),
-            ),
-            None => (String::new(), "?".into(), String::new()),
-        };
+    fn user_panel(&self, cx: &mut Context<Self>) -> Div {
+        let me = self.me.clone().unwrap_or_default();
         div()
             .h(px(52.))
             .flex_shrink_0()
@@ -502,14 +695,18 @@ impl DiscordApp {
             .items_center()
             .gap_2()
             .child(
-                div().relative().child(avatar(&id, &name, 32.)).child(
+                div().relative().child(self.avatar(&me, 32.)).child(
                     div()
                         .absolute()
                         .right(px(-2.))
                         .bottom(px(-2.))
                         .size(px(12.))
                         .rounded_full()
-                        .bg(rgb(color::GREEN))
+                        .bg(rgb(if self.connected {
+                            color::GREEN
+                        } else {
+                            color::MUTED
+                        }))
                         .border_2()
                         .border_color(rgb(color::PANEL)),
                 ),
@@ -525,15 +722,34 @@ impl DiscordApp {
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(color::BRIGHT))
-                            .child(name),
+                            .child(me.display_name().to_string()),
                     )
-                    .child(div().text_xs().text_color(rgb(color::MUTED)).child(handle)),
+                    .child(div().text_xs().text_color(rgb(color::MUTED)).child(
+                        if self.connected {
+                            "En ligne"
+                        } else {
+                            "Hors connexion"
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .id("logout")
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
+                    .text_xs()
+                    .text_color(rgb(color::MUTED))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+                    .child("Quitter")
+                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
             )
     }
 
     // ---- chat pane -----------------------------------------------------
 
-    fn chat(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn chat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (prefix, title) = match &self.channel {
             Some(c) if c.is_dm() => ("@", c.title()),
             Some(c) => ("#", c.title()),
@@ -576,9 +792,53 @@ impl DiscordApp {
                             .text_color(rgb(color::MUTED))
                             .child(topic),
                     )
+            })
+            .child(div().flex_1())
+            .when(self.channel.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("members-toggle")
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(rgb(if self.show_members {
+                            color::BRIGHT
+                        } else {
+                            color::MUTED
+                        }))
+                        .hover(|d| d.bg(rgb(color::HOVER)))
+                        .child("Membres")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_members = !this.show_members;
+                            cx.notify();
+                        })),
+                )
             });
 
         let body: AnyElement = if self.channel.is_some() {
+            let older = (!self.history_done && self.messages.len() >= 50).then(|| {
+                div()
+                    .id("older")
+                    .mx_4()
+                    .mt_2()
+                    .py_1()
+                    .flex()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .text_sm()
+                    .text_color(rgb(color::LINK))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::HOVER)))
+                    .child(if self.loading_older {
+                        "Chargement…"
+                    } else {
+                        "Charger les messages précédents"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.load_older(cx)))
+            });
+            let rows = self.message_rows(cx);
             div()
                 .id("messages")
                 .flex_1()
@@ -587,8 +847,9 @@ impl DiscordApp {
                 .track_scroll(&self.scroll)
                 .flex()
                 .flex_col()
+                .children(older)
                 .child(self.welcome(prefix, &title))
-                .children(self.message_rows())
+                .children(rows)
                 .child(div().h(px(16.)).flex_shrink_0())
                 .into_any_element()
         } else {
@@ -612,11 +873,67 @@ impl DiscordApp {
             format!("Envoyer un message dans #{title}")
         };
 
-        div()
+        // Reply / edit banner attached on top of the composer.
+        let banner: Option<AnyElement> = if let Some(r) = &self.replying {
+            Some(self.banner(format!("Réponse à {}", r.author.display_name()), cx))
+        } else if self.editing.is_some() {
+            Some(self.banner("Modification du message · Échap pour annuler".into(), cx))
+        } else {
+            None
+        };
+        let has_banner = banner.is_some();
+
+        let composer = self.channel.is_some().then(|| {
+            div()
+                .px_4()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .children(banner)
+                .child(
+                    div()
+                        .min_h(px(44.))
+                        .py(px(10.))
+                        .px_4()
+                        .when(has_banner, |d| d.rounded_b(px(8.)))
+                        .when(!has_banner, |d| d.rounded(px(8.)))
+                        .bg(rgb(color::INPUT))
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(24.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(color::MUTED))
+                                .text_color(rgb(color::INPUT))
+                                .font_weight(FontWeight::BOLD)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child("+"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(self.input_line(placeholder, false)),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(24.))
+                        .text_xs()
+                        .text_color(rgb(color::BRIGHT))
+                        .child(self.typing_text().unwrap_or_default()),
+                )
+        });
+
+        let main = div()
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(rgb(color::CHAT))
             .flex()
             .flex_col()
             .child(header)
@@ -631,44 +948,106 @@ impl DiscordApp {
                         .child(self.status.clone()),
                 )
             })
-            .when(self.channel.is_some(), |d| {
-                d.child(
-                    div().px_4().pb(px(24.)).flex_shrink_0().child(
-                        div()
-                            .min_h(px(44.))
-                            .px_4()
-                            .rounded(px(8.))
-                            .bg(rgb(color::INPUT))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(24.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(rgb(color::MUTED))
-                                    .text_color(rgb(color::INPUT))
-                                    .font_weight(FontWeight::BOLD)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child("+"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(self.input_line(placeholder, false)),
-                            ),
-                    ),
-                )
+            .children(composer);
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(rgb(color::CHAT))
+            .flex()
+            .child(main)
+            .when(self.show_members && self.channel.is_some(), |d| {
+                d.child(self.members_panel())
             })
+    }
+
+    fn banner(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .px_4()
+            .py(px(6.))
+            .rounded_t(px(8.))
+            .bg(rgb(color::SIDEBAR))
+            .flex()
+            .items_center()
+            .text_sm()
+            .text_color(rgb(color::MUTED))
+            .child(div().flex_1().overflow_hidden().child(text))
+            .child(
+                div()
+                    .id("cancel-compose")
+                    .px_2()
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(rgb(color::BRIGHT)))
+                    .child("✕")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_compose();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn members_panel(&self) -> Stateful<Div> {
+        let mut people: Vec<User> = Vec::new();
+        let mut label = "PARTICIPANTS RÉCENTS";
+        if let Some(c) = &self.channel {
+            if c.is_dm() {
+                label = "MEMBRES";
+                people.extend(c.recipients.iter().cloned());
+                people.extend(self.me.iter().cloned());
+            } else {
+                for m in self.messages.iter().rev() {
+                    if !people.iter().any(|u| u.id == m.author.id) {
+                        people.push(m.author.clone());
+                    }
+                }
+            }
+        }
+        div()
+            .id("members")
+            .w(px(240.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(color::SIDEBAR))
+            .overflow_y_scroll()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(color::MUTED))
+                    .child(format!("{label} — {}", people.len())),
+            )
+            .children(people.iter().map(|u| {
+                div()
+                    .h(px(42.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded(px(4.))
+                    .hover(|d| d.bg(rgb(color::HOVER)))
+                    .child(self.avatar(u, 32.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_color(rgb(color::MUTED))
+                            .child(u.display_name().to_string()),
+                    )
+            }))
     }
 
     fn welcome(&self, prefix: &str, title: &str) -> Div {
         // Only when the whole history fits in what we fetched.
-        if self.messages.len() >= 50 {
+        if !self.history_done && self.messages.len() >= 50 {
             return div();
         }
         div()
@@ -696,7 +1075,7 @@ impl DiscordApp {
             }))
     }
 
-    fn message_rows(&self) -> Vec<AnyElement> {
+    fn message_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = Vec::with_capacity(self.messages.len());
         let mut prev: Option<(&Message, DateTime<Local>)> = None;
         for m in &self.messages {
@@ -719,7 +1098,7 @@ impl DiscordApp {
                     }
                     _ => false,
                 };
-            rows.push(Self::message_row(m, time.as_ref(), grouped));
+            rows.push(self.message_row(m, time.as_ref(), grouped, cx));
             if let Some(t) = time {
                 prev = Some((m, t));
             }
@@ -749,7 +1128,264 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    fn message_row(m: &Message, time: Option<&DateTime<Local>>, grouped: bool) -> AnyElement {
+    /// Message text with mentions resolved and Markdown applied.
+    fn rich_text(&self, m: &Message, edited: bool) -> AnyElement {
+        let lookup = |kind: char, id: &str| -> Option<String> {
+            match kind {
+                '@' => m
+                    .mentions
+                    .iter()
+                    .find(|u| u.id == id)
+                    .map(|u| u.display_name().to_string())
+                    .or_else(|| self.known_users.get(id).cloned())
+                    .map(|n| format!("@{n}")),
+                '#' => self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| format!("#{}", c.title())),
+                _ => None,
+            }
+        };
+        let resolved = resolve_tokens(&m.content, &lookup);
+        let (mut text, mut hl) = markdown(&resolved, false);
+        if edited {
+            let start = text.len();
+            text.push_str(" (modifié)");
+            hl.push((
+                start..text.len(),
+                HighlightStyle {
+                    color: Some(rgb(color::MUTED).into()),
+                    ..Default::default()
+                },
+            ));
+        }
+        StyledText::new(text).with_highlights(hl).into_any_element()
+    }
+
+    fn attachment(&self, a: &crate::api::Attachment) -> AnyElement {
+        if a.is_image() {
+            let (w, h) = (
+                a.width.unwrap_or(400) as f32,
+                a.height.unwrap_or(300) as f32,
+            );
+            let scale = (400. / w).min(300. / h).min(1.);
+            let (w, h) = ((w * scale).max(32.), (h * scale).max(32.));
+            return match self.images.get(&a.preview_url()) {
+                Some(i) => img(i.clone())
+                    .w(px(w))
+                    .h(px(h))
+                    .rounded(px(8.))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => div()
+                    .w(px(w))
+                    .h(px(h))
+                    .rounded(px(8.))
+                    .bg(rgb(color::SIDEBAR))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(color::MUTED))
+                    .child("Chargement de l'image…")
+                    .into_any_element(),
+            };
+        }
+        div()
+            .px_3()
+            .py_2()
+            .rounded(px(4.))
+            .bg(rgb(color::SIDEBAR))
+            .text_color(rgb(color::LINK))
+            .child(a.filename.clone())
+            .into_any_element()
+    }
+
+    fn embed(&self, e: &crate::api::Embed) -> AnyElement {
+        let mut body = div().flex().flex_col().gap_1().min_w_0();
+        if let Some(a) = &e.author {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(a.name.clone()),
+            );
+        }
+        if let Some(t) = &e.title {
+            body = body.child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if e.url.is_some() {
+                        color::LINK
+                    } else {
+                        color::BRIGHT
+                    }))
+                    .child(t.clone()),
+            );
+        }
+        if let Some(d) = &e.description {
+            let (text, hl) = markdown(d, false);
+            body = body.child(
+                div()
+                    .text_sm()
+                    .child(StyledText::new(text).with_highlights(hl)),
+            );
+        }
+        for f in &e.fields {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(color::BRIGHT))
+                            .child(f.name.clone()),
+                    )
+                    .child(div().text_sm().child(f.value.clone())),
+            );
+        }
+        if let Some(i) = e
+            .image
+            .as_ref()
+            .and_then(|m| self.images.get(&m.preview_url()))
+        {
+            body = body.child(
+                img(i.clone())
+                    .w(px(360.))
+                    .h(px(220.))
+                    .rounded(px(4.))
+                    .object_fit(ObjectFit::Contain),
+            );
+        }
+        let mut row = div().flex().gap_3().child(body.flex_1());
+        if let Some(i) = e
+            .thumbnail
+            .as_ref()
+            .and_then(|m| self.images.get(&m.preview_url()))
+        {
+            row = row.child(
+                img(i.clone())
+                    .size(px(64.))
+                    .flex_shrink_0()
+                    .rounded(px(4.))
+                    .object_fit(ObjectFit::Cover),
+            );
+        }
+        div()
+            .mt_1()
+            .max_w(px(520.))
+            .p_3()
+            .rounded_r(px(4.))
+            .bg(rgb(color::SIDEBAR))
+            .border_l_4()
+            .border_color(rgb(e.color.unwrap_or(color::DIVIDER)))
+            .child(row)
+            .into_any_element()
+    }
+
+    fn reactions(&self, m: &Message, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .mt_1()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(m.reactions.iter().map(|r| {
+                let (msg, emoji, me) = (m.clone(), r.emoji.clone(), r.me);
+                let glyph: AnyElement =
+                    match r.emoji.url().and_then(|u| self.images.get(&u).cloned()) {
+                        Some(i) => img(i).size(px(18.)).into_any_element(),
+                        None if r.emoji.id.is_some() => div()
+                            .text_xs()
+                            .child(format!(":{}:", r.emoji.label()))
+                            .into_any_element(),
+                        None => div().child(r.emoji.label()).into_any_element(),
+                    };
+                div()
+                    .id(SharedString::from(format!(
+                        "r-{}-{}",
+                        m.id,
+                        r.emoji.api_key()
+                    )))
+                    .h(px(24.))
+                    .px(px(6.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(if me { color::BRAND } else { color::SIDEBAR }))
+                    .bg(rgb(if me { 0x3b405a } else { color::SIDEBAR }))
+                    .hover(|d| d.border_color(rgb(color::DIVIDER)))
+                    .child(glyph)
+                    .child(div().text_sm().child(r.count.to_string()))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_reaction(&msg, &emoji, me, cx)
+                        }),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// Hover toolbar: reply, and edit/delete on our own messages.
+    fn toolbar(&self, m: &Message, group: SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let mine = self.me.as_ref().is_some_and(|u| u.id == m.author.id);
+        let armed = self.confirm_delete.as_deref() == Some(&m.id);
+        let btn = |id: String, label: &str, danger: bool| {
+            div()
+                .id(SharedString::from(id))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(rgb(if danger { color::RED } else { color::MUTED }))
+                .hover(|d| d.bg(rgb(color::HOVER)))
+                .child(label.to_string())
+        };
+        let (reply, edit, del) = (m.clone(), m.clone(), m.clone());
+        div()
+            .absolute()
+            .top(px(-14.))
+            .right(px(16.))
+            .flex()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(rgb(color::RAIL))
+            .bg(rgb(color::CHAT))
+            .opacity(0.)
+            .group_hover(group, |s| s.opacity(1.))
+            .child(
+                btn(format!("reply-{}", m.id), "Répondre", false)
+                    .on_click(cx.listener(move |this, _, _, cx| this.start_reply(&reply, cx))),
+            )
+            .when(mine, |d| {
+                d.child(
+                    btn(format!("edit-{}", m.id), "Modifier", false)
+                        .on_click(cx.listener(move |this, _, _, cx| this.start_edit(&edit, cx))),
+                )
+                .child(
+                    btn(
+                        format!("del-{}", m.id),
+                        if armed { "Confirmer ?" } else { "Supprimer" },
+                        true,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.delete_message(&del, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn message_row(
+        &self,
+        m: &Message,
+        time: Option<&DateTime<Local>>,
+        grouped: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let group: SharedString = format!("m-{}", m.id).into();
         let name = m.author.display_name().to_string();
 
@@ -772,24 +1408,16 @@ impl DiscordApp {
             text = text.child(head);
         }
         if !m.content.is_empty() {
-            text = text.child(div().child(m.content.clone()).when(
-                m.edited_timestamp.is_some(),
-                |d| {
-                    d.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(color::MUTED))
-                            .child(" (modifié)"),
-                    )
-                },
-            ));
+            text = text.child(self.rich_text(m, m.edited_timestamp.is_some()));
         }
         for a in &m.attachments {
-            text = text.child(
-                div()
-                    .text_color(rgb(color::LINK))
-                    .child(format!("📎 {}", a.filename)),
-            );
+            text = text.child(div().mt_1().child(self.attachment(a)));
+        }
+        for e in &m.embeds {
+            text = text.child(self.embed(e));
+        }
+        if !m.reactions.is_empty() {
+            text = text.child(self.reactions(m, cx));
         }
 
         let gutter = if grouped {
@@ -803,12 +1431,14 @@ impl DiscordApp {
                 .opacity(0.)
                 .group_hover(group.clone(), |s| s.opacity(1.))
                 .child(time.map(hhmm).unwrap_or_default())
+                .into_any_element()
         } else {
-            avatar(&m.author.id, &name, 40.)
+            self.avatar(&m.author, 40.)
         };
 
         let mut row = div()
-            .group(group)
+            .group(group.clone())
+            .relative()
             .px_4()
             .py(px(2.))
             .when(!grouped, |d| d.mt(px(14.)))
@@ -828,6 +1458,7 @@ impl DiscordApp {
                     .text_color(rgb(color::MUTED))
                     .overflow_hidden()
                     .child("↱")
+                    .child(self.avatar(&r.author, 16.))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
@@ -842,6 +1473,21 @@ impl DiscordApp {
             );
         }
         row.child(div().flex().gap_4().child(gutter).child(text))
+            .child(self.toolbar(m, group, cx))
             .into_any_element()
     }
+}
+
+/// Highlights clipped to `from..to`, re-based to start at 0.
+fn slice_hl(
+    hl: &[(Range<usize>, HighlightStyle)],
+    from: usize,
+    to: usize,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    hl.iter()
+        .filter_map(|(r, s)| {
+            let (a, b) = (r.start.max(from), r.end.min(to));
+            (a < b).then(|| (a - from..b - from, *s))
+        })
+        .collect()
 }
