@@ -13,3 +13,10 @@ DISCORD_TOKEN=... cargo run --release
 Requires GPUI's Linux system deps (wayland/xcb, vulkan, fontconfig, etc.).
 `Cargo.lock` pins `libc` to 0.2.189 because `xattr` 0.2.3 (via gpui) fails with 0.2.190.
 Don't use user tokens: self-botting violates Discord's ToS.
+
+## Windows x64
+
+Built by `.github/workflows/windows.yml` on a Windows runner (GPUI compiles its
+DirectX shaders with `fxc.exe` at build time, so it can't be cross-compiled from Linux).
+Download `discord-test-windows-x64` from the workflow run's artifacts, or build locally on
+Windows with `cargo build --release`.
