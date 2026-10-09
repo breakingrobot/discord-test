@@ -1,24 +1,68 @@
 mod api;
+mod emoji;
 mod gateway;
+mod qr;
+mod store;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     prelude::*, px, size, App, Application, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
-    Image, ImageFormat, KeyDownEvent, Render, ScrollHandle, Window, WindowBounds, WindowOptions,
+    Image, ImageFormat, KeyDownEvent, PathPromptOptions, Render, ScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 
 use api::{Channel, Emoji, Guild, Message, User};
 
-/// Poll interval while the gateway is down / as a slow safety net while it is up.
-const POLL_FAST: Duration = Duration::from_secs(3);
-const POLL_SLOW: Duration = Duration::from_secs(20);
+/// REST polling happens only while the gateway is down.
+const POLL_FAST: Duration = Duration::from_secs(4);
 const TYPING_TTL: Duration = Duration::from_secs(8);
 const MAX_INFLIGHT_IMAGES: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Email = 0,
+    Password = 1,
+    Token = 2,
+    Code = 3,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoginMode {
+    Credentials,
+    Token,
+    Mfa,
+}
+
+pub enum QrState {
+    Loading,
+    Ready,
+    Scanned(String),
+    Failed(String),
+}
+
+#[derive(Clone, Default)]
+pub struct Unread {
+    pub guild: Option<String>,
+    pub mentions: u32,
+}
+
+pub enum Picker {
+    Composer,
+    React(Message),
+}
+
+#[derive(Clone)]
+pub enum Target {
+    Home,
+    Guild(String),
+    Channel(Channel),
+}
 
 pub struct DiscordApp {
     focus: FocusHandle,
@@ -56,6 +100,22 @@ pub struct DiscordApp {
     images: HashMap<String, Arc<Image>>,
     image_pending: HashSet<String>,
     image_failed: HashSet<String>,
+    // login screen
+    field: Field,
+    login_mode: LoginMode,
+    form: [String; 4],
+    mfa_ticket: String,
+    login_busy: bool,
+    autologin: bool,
+    qr: QrState,
+    qr_cells: Vec<Vec<bool>>,
+    qr_stop: Arc<AtomicBool>,
+    // extras
+    unread: HashMap<String, Unread>,
+    friends: Vec<User>,
+    picker: Option<Picker>,
+    switcher: Option<String>,
+    switcher_sel: usize,
 }
 
 fn snowflake(id: &str) -> u64 {
@@ -109,11 +169,30 @@ impl DiscordApp {
             images: HashMap::new(),
             image_pending: HashSet::new(),
             image_failed: HashSet::new(),
+            field: Field::Email,
+            login_mode: LoginMode::Credentials,
+            form: Default::default(),
+            mfa_ticket: String::new(),
+            login_busy: false,
+            autologin: false,
+            qr: QrState::Loading,
+            qr_cells: vec![],
+            qr_stop: Arc::new(AtomicBool::new(false)),
+            unread: HashMap::new(),
+            friends: vec![],
+            picker: None,
+            switcher: None,
+            switcher_sel: 0,
         };
-        if let Ok(token) = std::env::var("DISCORD_TOKEN") {
-            if !token.trim().is_empty() {
+        let env = std::env::var("DISCORD_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+        match env.or_else(store::load) {
+            Some(token) => {
+                this.autologin = true;
                 this.login(token.trim().to_string(), cx);
             }
+            None => this.start_qr(cx),
         }
         this
     }
@@ -158,12 +237,26 @@ impl DiscordApp {
 
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let len = self.input.chars().count();
         let cmd = ks.modifiers.control || ks.modifiers.platform;
+        if self.logged_in && cmd && ks.key == "k" {
+            self.switcher = match self.switcher {
+                Some(_) => None,
+                None => Some(String::new()),
+            };
+            self.switcher_sel = 0;
+            self.picker = None;
+            return cx.notify();
+        }
+        if self.switcher.is_some() {
+            return self.on_switcher_key(ev, cx);
+        }
+        let len = self.input.chars().count();
         let before = self.input.len();
         match ks.key.as_str() {
+            "tab" if !self.logged_in => self.cycle_field(),
             "enter" if ks.modifiers.shift => self.insert("\n"),
             "enter" => return self.submit(cx),
+            "escape" if self.picker.is_some() => self.picker = None,
             "escape" => self.cancel_compose(),
             "backspace" if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -203,6 +296,328 @@ impl DiscordApp {
         cx.notify();
     }
 
+    // ---- login form ------------------------------------------------------
+
+    fn sync_field(&mut self) {
+        self.form[self.field as usize] = self.input.clone();
+    }
+
+    pub fn set_field(&mut self, f: Field) {
+        self.sync_field();
+        self.field = f;
+        self.set_input(self.form[f as usize].clone());
+    }
+
+    fn cycle_field(&mut self) {
+        let next = match (self.login_mode, self.field) {
+            (LoginMode::Credentials, Field::Email) => Field::Password,
+            _ => Field::Email,
+        };
+        if self.login_mode == LoginMode::Credentials {
+            self.set_field(next);
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: LoginMode, cx: &mut Context<Self>) {
+        self.sync_field();
+        self.login_mode = mode;
+        let f = match mode {
+            LoginMode::Credentials => Field::Email,
+            LoginMode::Token => Field::Token,
+            LoginMode::Mfa => Field::Code,
+        };
+        self.field = f;
+        self.set_input(self.form[f as usize].clone());
+        self.status.clear();
+        cx.notify();
+    }
+
+    pub fn submit_login(&mut self, cx: &mut Context<Self>) {
+        if self.login_busy {
+            return;
+        }
+        self.sync_field();
+        match self.login_mode {
+            LoginMode::Credentials => {
+                if self.field == Field::Email {
+                    return self.set_field(Field::Password);
+                }
+                let (email, pw) = (
+                    self.form[Field::Email as usize].trim().to_string(),
+                    self.form[Field::Password as usize].clone(),
+                );
+                if email.is_empty() || pw.is_empty() {
+                    self.status = "Renseignez votre e-mail et votre mot de passe.".into();
+                    return;
+                }
+                self.login_busy = true;
+                self.status = "Connexion…".into();
+                cx.spawn(async move |this, cx| {
+                    let res = cx
+                        .background_spawn(async move { api::password_login(&email, &pw) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.login_busy = false;
+                        match res {
+                            Ok(api::PasswordLogin::Token(t)) => this.login(t, cx),
+                            Ok(api::PasswordLogin::Mfa(ticket)) => {
+                                this.mfa_ticket = ticket;
+                                this.set_mode(LoginMode::Mfa, cx);
+                            }
+                            Ok(api::PasswordLogin::Captcha) => {
+                                this.status =
+                                    "Discord demande un captcha : utilisez le code QR ou un token."
+                                        .into();
+                            }
+                            Err(e) => this.status = e,
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            LoginMode::Token => {
+                let t = self.form[Field::Token as usize].trim().to_string();
+                if !t.is_empty() {
+                    self.login(t, cx);
+                }
+            }
+            LoginMode::Mfa => {
+                let code = self.form[Field::Code as usize].trim().to_string();
+                let ticket = self.mfa_ticket.clone();
+                if code.is_empty() {
+                    return;
+                }
+                self.login_busy = true;
+                self.status = "Vérification…".into();
+                cx.spawn(async move |this, cx| {
+                    let res = cx
+                        .background_spawn(async move { api::mfa_totp(&code, &ticket) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.login_busy = false;
+                        match res {
+                            Ok(t) => this.login(t, cx),
+                            Err(e) => this.status = e,
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn start_qr(&mut self, cx: &mut Context<Self>) {
+        self.qr_stop.store(true, Ordering::Relaxed);
+        self.qr_stop = Arc::new(AtomicBool::new(false));
+        self.qr = QrState::Loading;
+        let (tx, rx) = flume::unbounded();
+        qr::spawn(tx, self.qr_stop.clone());
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = rx.recv_async().await {
+                let done = matches!(ev, qr::QrEvent::Token(_) | qr::QrEvent::Failed(_));
+                let alive = this.update(cx, |this, cx| {
+                    match ev {
+                        qr::QrEvent::Code(url) => {
+                            if let Ok(code) = qrcode::QrCode::new(url.as_bytes()) {
+                                let w = code.width();
+                                let colors = code.to_colors();
+                                this.qr_cells = colors
+                                    .chunks(w)
+                                    .map(|row| {
+                                        row.iter().map(|c| *c == qrcode::Color::Dark).collect()
+                                    })
+                                    .collect();
+                                this.qr = QrState::Ready;
+                            }
+                        }
+                        qr::QrEvent::Scanned(name) => this.qr = QrState::Scanned(name),
+                        qr::QrEvent::Token(t) => this.login(t, cx),
+                        qr::QrEvent::Failed(e) => this.qr = QrState::Failed(e),
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() || done {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    // ---- quick switcher / pickers / files -----------------------------------
+
+    pub fn switcher_items(&self) -> Vec<(String, Target)> {
+        let q = self.switcher.clone().unwrap_or_default().to_lowercase();
+        let mut items: Vec<(String, Target)> =
+            vec![("Amis · Messages privés".into(), Target::Home)];
+        items.extend(
+            self.guilds
+                .iter()
+                .map(|g| (g.name.clone(), Target::Guild(g.id.clone()))),
+        );
+        items.extend(
+            self.dms
+                .iter()
+                .map(|c| (format!("@{}", c.title()), Target::Channel(c.clone()))),
+        );
+        items.extend(
+            self.channels
+                .iter()
+                .filter(|c| c.kind != 4)
+                .map(|c| (format!("#{}", c.title()), Target::Channel(c.clone()))),
+        );
+        items.retain(|(label, _)| label.to_lowercase().contains(&q));
+        items.truncate(12);
+        items
+    }
+
+    fn on_switcher_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let items = self.switcher_items();
+        match ks.key.as_str() {
+            "escape" => self.switcher = None,
+            "up" => self.switcher_sel = self.switcher_sel.saturating_sub(1),
+            "down" => {
+                self.switcher_sel = (self.switcher_sel + 1).min(items.len().saturating_sub(1))
+            }
+            "backspace" => {
+                if let Some(q) = &mut self.switcher {
+                    q.pop();
+                }
+                self.switcher_sel = 0;
+            }
+            "enter" => {
+                if let Some((_, target)) = items.get(self.switcher_sel).cloned() {
+                    self.go(target, cx);
+                }
+            }
+            _ => {
+                if ks.modifiers.control || ks.modifiers.platform {
+                    return;
+                }
+                if let (Some(ch), Some(q)) = (&ks.key_char, &mut self.switcher) {
+                    q.push_str(ch);
+                    self.switcher_sel = 0;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn go(&mut self, target: Target, cx: &mut Context<Self>) {
+        self.switcher = None;
+        match target {
+            Target::Home => self.open_home(cx),
+            Target::Guild(id) => self.select_guild(id, cx),
+            Target::Channel(c) => {
+                if c.is_dm() && self.guild.is_some() {
+                    self.guild = None;
+                    self.channels.clear();
+                }
+                self.select_channel(c, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn pick_emoji(&mut self, e: &str, cx: &mut Context<Self>) {
+        match self.picker.take() {
+            Some(Picker::React(m)) => {
+                let emoji = Emoji {
+                    id: None,
+                    name: Some(e.to_string()),
+                };
+                self.toggle_reaction(&m, &emoji, false, cx);
+            }
+            Some(Picker::Composer) => self.insert(e),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    pub fn pick_files(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Envoyer".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                this.update(cx, |this, cx| this.upload(paths, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let (auth, text) = (self.auth.clone(), self.input.trim().to_string());
+        self.clear_input();
+        self.status = "Envoi du fichier…".into();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::upload(&auth, &channel.id, &text, &paths) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.status = match res {
+                    Ok(()) => String::new(),
+                    Err(e) => format!("Envoi impossible : {e}"),
+                };
+                this.last_msg_id = None;
+                this.refresh_messages(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn open_dm_with(&mut self, user: &User, cx: &mut Context<Self>) {
+        let (auth, id) = (self.auth.clone(), user.id.clone());
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::open_dm(&auth, &id) })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(c) => {
+                        if !this.dms.iter().any(|d| d.id == c.id) {
+                            this.dms.insert(0, c.clone());
+                        }
+                        this.select_channel(c, cx);
+                    }
+                    Err(e) => this.status = format!("Conversation impossible : {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn ack_current(&mut self, cx: &mut Context<Self>) {
+        if self.auth.starts_with("Bot ") {
+            return;
+        }
+        let (Some(c), Some(last)) = (self.channel.clone(), self.messages.last()) else {
+            return;
+        };
+        let (auth, mid) = (self.auth.clone(), last.id.clone());
+        cx.background_spawn(async move {
+            let _ = api::ack(&auth, &c.id, &mid);
+        })
+        .detach();
+    }
+
     fn send_typing(&mut self, cx: &mut Context<Self>) {
         let Some(channel) = self.channel.clone() else {
             return;
@@ -226,11 +641,10 @@ impl DiscordApp {
 
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
         if !self.logged_in {
-            self.login(text, cx);
+            return self.submit_login(cx);
+        }
+        if text.is_empty() {
             return;
         }
         let Some(channel) = self.channel.clone() else {
@@ -398,6 +812,7 @@ impl DiscordApp {
     // ---- login / gateway -----------------------------------------------
 
     fn login(&mut self, token: String, cx: &mut Context<Self>) {
+        self.login_busy = true;
         self.status = "Connexion…".into();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -406,12 +821,15 @@ impl DiscordApp {
                     let (auth, me) = api::login(&token)?;
                     let guilds = api::guilds(&auth)?;
                     let dms = api::dms(&auth).unwrap_or_default();
-                    Ok::<_, String>((auth, me, guilds, dms))
+                    let friends = api::friends(&auth).unwrap_or_default();
+                    Ok::<_, String>((auth, me, guilds, dms, friends))
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.login_busy = false;
                 match res {
-                    Ok((auth, me, guilds, dms)) => {
+                    Ok((auth, me, guilds, dms, friends)) => {
+                        store::save(&auth);
                         this.auth = auth;
                         this.known_users
                             .insert(me.id.clone(), me.display_name().to_string());
@@ -419,13 +837,25 @@ impl DiscordApp {
                         this.guilds = guilds;
                         this.learn_dm_users(&dms);
                         this.dms = dms;
+                        this.friends = friends;
                         this.logged_in = true;
+                        this.autologin = false;
                         this.status.clear();
+                        this.form = Default::default();
                         this.clear_input();
+                        this.qr_stop.store(true, Ordering::Relaxed);
                         this.start_gateway(cx);
                         this.start_polling(cx);
                     }
-                    Err(e) => this.status = format!("Connexion impossible : {e}"),
+                    Err(e) => {
+                        if this.autologin {
+                            // Stored token is stale: forget it and offer the normal login.
+                            store::clear();
+                            this.autologin = false;
+                            this.start_qr(cx);
+                        }
+                        this.status = format!("Connexion impossible : {e}");
+                    }
                 }
                 cx.notify();
             })
@@ -450,6 +880,14 @@ impl DiscordApp {
         self.cancel_compose();
         self.clear_input();
         self.status.clear();
+        self.unread.clear();
+        self.friends.clear();
+        self.picker = None;
+        self.switcher = None;
+        self.login_mode = LoginMode::Credentials;
+        self.field = Field::Email;
+        store::clear();
+        self.start_qr(cx);
         cx.notify();
     }
 
@@ -474,14 +912,32 @@ impl DiscordApp {
                 self.learn_users(std::slice::from_ref(&m));
                 self.typing
                     .remove(&(m.channel_id.clone(), m.author.id.clone()));
-                if self.channel.as_ref().map(|c| &c.id) == Some(&m.channel_id)
-                    && !self.messages.iter().any(|x| x.id == m.id)
-                {
-                    self.follow_if_at_bottom();
-                    self.last_msg_id = Some(m.id.clone());
-                    self.messages.push(m);
-                } else if self.guild.is_none() {
-                    self.refresh_dms(cx);
+                let mine = self.me.as_ref().is_some_and(|u| u.id == m.author.id);
+                if self.channel.as_ref().map(|c| &c.id) == Some(&m.channel_id) {
+                    if !self.messages.iter().any(|x| x.id == m.id) {
+                        self.follow_if_at_bottom();
+                        self.last_msg_id = Some(m.id.clone());
+                        self.messages.push(m);
+                        self.ack_current(cx);
+                    }
+                } else if !mine {
+                    let me = self.me.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+                    let pinged = m.guild_id.is_none()
+                        || m.mention_everyone
+                        || m.mentions.iter().any(|u| u.id == me);
+                    let e = self
+                        .unread
+                        .entry(m.channel_id.clone())
+                        .or_insert_with(|| Unread {
+                            guild: m.guild_id.clone(),
+                            mentions: 0,
+                        });
+                    if pinged {
+                        e.mentions += 1;
+                    }
+                    if self.guild.is_none() {
+                        self.refresh_dms(cx);
+                    }
                 }
             }
             ChannelChanged(cid) => {
@@ -513,22 +969,20 @@ impl DiscordApp {
         }
     }
 
-    /// Falls back to polling when the gateway is down; slow safety net otherwise.
+    /// REST polling is only a fallback while the gateway is down.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         let stop = self.gateway_stop.clone();
         cx.spawn(async move |this, cx| loop {
-            let Ok(connected) = this.update(cx, |this, _| this.connected) else {
-                break;
-            };
-            let wait = if connected { POLL_SLOW } else { POLL_FAST };
-            cx.background_executor().timer(wait).await;
+            cx.background_executor().timer(POLL_FAST).await;
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let alive = this.update(cx, |this, cx| {
-                this.refresh_messages(cx);
-                if this.guild.is_none() {
-                    this.refresh_dms(cx);
+                if !this.connected {
+                    this.refresh_messages(cx);
+                    if this.guild.is_none() {
+                        this.refresh_dms(cx);
+                    }
                 }
                 // Expire typing indicators and re-render.
                 this.typing.retain(|_, t| t.elapsed() < TYPING_TTL);
@@ -562,6 +1016,20 @@ impl DiscordApp {
         self.reset_channel();
         self.channels.clear();
         self.refresh_dms(cx);
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(f) = cx
+                .background_spawn(async move { api::friends(&auth) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.friends = f;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -622,6 +1090,7 @@ impl DiscordApp {
 
     fn select_channel(&mut self, channel: Channel, cx: &mut Context<Self>) {
         self.reset_channel();
+        self.unread.remove(&channel.id);
         self.channel = Some(channel);
         self.status.clear();
         self.refresh_messages(cx);
@@ -644,7 +1113,7 @@ impl DiscordApp {
                     return;
                 }
                 match res {
-                    Ok(fresh) => this.merge_messages(fresh),
+                    Ok(fresh) => this.merge_messages(fresh, cx),
                     Err(e) => this.status = format!("Messages indisponibles : {e}"),
                 }
                 cx.notify();
@@ -655,7 +1124,7 @@ impl DiscordApp {
     }
 
     /// Replaces the newest page, keeping any older history already loaded.
-    fn merge_messages(&mut self, fresh: Vec<Message>) {
+    fn merge_messages(&mut self, fresh: Vec<Message>, cx: &mut Context<Self>) {
         self.learn_users(&fresh);
         let newest = fresh.last().map(|x| x.id.clone());
         if newest != self.last_msg_id {
@@ -675,6 +1144,7 @@ impl DiscordApp {
         merged.extend(fresh);
         self.messages = merged;
         self.status.clear();
+        self.ack_current(cx);
     }
 
     // ---- images ----------------------------------------------------------

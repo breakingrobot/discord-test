@@ -2,9 +2,15 @@
 
 use std::io::Read;
 
+use base64::Engine;
 use serde::Deserialize;
+use serde_json::{json, Value};
 
-const BASE: &str = "https://discord.com/api/v10";
+const BASE: &str = "https://discord.com/api/v9";
+
+/// Mimic the official web client (what Abaddon/Dissent do) to stay out of the spam filter.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const BUILD_NUMBER: u32 = 350_000;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct User {
@@ -201,6 +207,10 @@ pub struct Message {
     pub id: String,
     #[serde(default)]
     pub channel_id: String,
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    #[serde(default)]
+    pub mention_everyone: bool,
     pub content: String,
     pub author: User,
     /// RFC 3339.
@@ -219,16 +229,67 @@ pub struct Message {
     pub referenced_message: Option<Box<Message>>,
 }
 
-fn auth_get(token: &str, path: &str) -> ureq::Request {
-    ureq::get(&format!("{BASE}{path}")).set("Authorization", token)
+/// Client fingerprint sent both as a header and in the gateway IDENTIFY.
+pub fn super_properties() -> Value {
+    json!({
+        "os": "Windows",
+        "browser": "Chrome",
+        "device": "",
+        "system_locale": "fr-FR",
+        "browser_user_agent": USER_AGENT,
+        "browser_version": "131.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
+        "release_channel": "stable",
+        "client_build_number": BUILD_NUMBER,
+        "client_event_source": null,
+    })
+}
+
+fn request(method: &str, path: &str, auth: Option<&str>) -> ureq::Request {
+    let props = base64::engine::general_purpose::STANDARD.encode(super_properties().to_string());
+    let mut r = ureq::request(method, &format!("{BASE}{path}"))
+        .set("User-Agent", USER_AGENT)
+        .set("X-Super-Properties", &props)
+        .set("X-Discord-Locale", "fr")
+        .set("Accept-Language", "fr-FR,fr;q=0.9")
+        .set("Origin", "https://discord.com")
+        .set("Referer", "https://discord.com/channels/@me");
+    if let Some(a) = auth {
+        r = r.set("Authorization", a);
+    }
+    r
+}
+
+/// Human-readable message out of a Discord error response.
+fn describe(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let body: Value = resp.into_json().unwrap_or(Value::Null);
+            match body["message"].as_str() {
+                Some(m) => format!("{m} ({code})"),
+                None => format!("HTTP {code}"),
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 fn get<T: for<'de> Deserialize<'de>>(token: &str, path: &str) -> Result<T, String> {
-    auth_get(token, path)
+    request("GET", path, Some(token))
         .call()
-        .map_err(|e| e.to_string())?
+        .map_err(describe)?
         .into_json()
         .map_err(|e| e.to_string())
+}
+
+fn send_json(method: &str, token: &str, path: &str, body: Value) -> Result<ureq::Response, String> {
+    request(method, path, Some(token))
+        .send_json(body)
+        .map_err(describe)
 }
 
 /// Validates a token. Tries it as a user token first, then as a bot token.
@@ -243,6 +304,73 @@ pub fn login(token: &str) -> Result<(String, User), String> {
                 .map_err(|_| first)
         }
     }
+}
+
+pub enum PasswordLogin {
+    Token(String),
+    /// Two-factor code required; carries the MFA ticket.
+    Mfa(String),
+    Captcha,
+}
+
+/// E-mail/phone + password sign-in. Discord frequently demands a captcha here.
+pub fn password_login(login: &str, password: &str) -> Result<PasswordLogin, String> {
+    let body = json!({
+        "login": login, "password": password, "undelete": false,
+        "login_source": null, "gift_code_sku_id": null,
+    });
+    match request("POST", "/auth/login", None).send_json(body) {
+        Ok(resp) => {
+            let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+            if let Some(t) = v["token"].as_str() {
+                Ok(PasswordLogin::Token(t.to_string()))
+            } else if let Some(t) = v["ticket"].as_str() {
+                Ok(PasswordLogin::Mfa(t.to_string()))
+            } else {
+                Err("Réponse inattendue de Discord".into())
+            }
+        }
+        Err(ureq::Error::Status(_, resp)) => {
+            let v: Value = resp.into_json().unwrap_or(Value::Null);
+            if v.get("captcha_key").is_some() {
+                Ok(PasswordLogin::Captcha)
+            } else if let Some(errs) = v["errors"].as_object() {
+                let _ = errs;
+                Err("E-mail ou mot de passe invalide.".into())
+            } else {
+                Err(v["message"]
+                    .as_str()
+                    .unwrap_or("Connexion refusée")
+                    .to_string())
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn mfa_totp(code: &str, ticket: &str) -> Result<String, String> {
+    let v: Value = request("POST", "/auth/mfa/totp", None)
+        .send_json(json!({ "code": code, "ticket": ticket, "login_source": null, "gift_code_sku_id": null }))
+        .map_err(describe)?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    v["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "Code invalide".into())
+}
+
+/// Second step of QR login: exchanges the scanned ticket for an encrypted token.
+pub fn remote_auth_login(ticket: &str) -> Result<String, String> {
+    let v: Value = request("POST", "/users/@me/remote-auth/login", None)
+        .send_json(json!({ "ticket": ticket }))
+        .map_err(describe)?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    v["encrypted_token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "Réponse inattendue de Discord".into())
 }
 
 pub fn guilds(token: &str) -> Result<Vec<Guild>, String> {
@@ -265,6 +393,36 @@ pub fn dms(token: &str) -> Result<Vec<Channel>, String> {
     Ok(chans)
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct Relationship {
+    #[serde(rename = "type")]
+    pub kind: u8,
+    pub user: User,
+}
+
+/// Friends (type 1) sorted by name.
+pub fn friends(token: &str) -> Result<Vec<User>, String> {
+    let rels: Vec<Relationship> = get(token, "/users/@me/relationships")?;
+    let mut users: Vec<User> = rels
+        .into_iter()
+        .filter(|r| r.kind == 1)
+        .map(|r| r.user)
+        .collect();
+    users.sort_by_key(|u| u.display_name().to_lowercase());
+    Ok(users)
+}
+
+pub fn open_dm(token: &str, user_id: &str) -> Result<Channel, String> {
+    send_json(
+        "POST",
+        token,
+        "/users/@me/channels",
+        json!({ "recipient_id": user_id }),
+    )?
+    .into_json()
+    .map_err(|e| e.to_string())
+}
+
 /// Oldest first. `before` pages backwards from a message id.
 pub fn messages(token: &str, channel: &str, before: Option<&str>) -> Result<Vec<Message>, String> {
     let mut path = format!("/channels/{channel}/messages?limit=50");
@@ -276,44 +434,126 @@ pub fn messages(token: &str, channel: &str, before: Option<&str>) -> Result<Vec<
     Ok(msgs)
 }
 
+fn nonce() -> String {
+    // Discord expects a snowflake-looking nonce; time-based is enough.
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    (((ms.saturating_sub(1_420_070_400_000)) << 22) | 7).to_string()
+}
+
 pub fn send(
     token: &str,
     channel: &str,
     content: &str,
     reply_to: Option<&str>,
 ) -> Result<(), String> {
-    let mut body = serde_json::json!({ "content": content });
+    let mut body = json!({ "content": content, "nonce": nonce(), "tts": false });
     if let Some(id) = reply_to {
-        body["message_reference"] = serde_json::json!({ "message_id": id });
+        body["message_reference"] = json!({ "message_id": id });
     }
-    ureq::post(&format!("{BASE}/channels/{channel}/messages"))
-        .set("Authorization", token)
-        .send_json(body)
-        .map_err(|e| e.to_string())?;
+    send_json(
+        "POST",
+        token,
+        &format!("/channels/{channel}/messages"),
+        body,
+    )?;
+    Ok(())
+}
+
+/// Sends files (multipart) with optional text.
+pub fn upload(
+    token: &str,
+    channel: &str,
+    content: &str,
+    files: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let boundary = format!("----discordgpui{}", nonce());
+    let mut body: Vec<u8> = Vec::new();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "fichier".into())
+        })
+        .collect();
+    let attachments: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| json!({ "id": i, "filename": n }))
+        .collect();
+    let payload = json!({ "content": content, "nonce": nonce(), "attachments": attachments });
+    body.extend(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{payload}\r\n"
+        )
+        .as_bytes(),
+    );
+    for (i, (path, name)) in files.iter().zip(&names).enumerate() {
+        let data = std::fs::read(path).map_err(|e| format!("{name} : {e}"))?;
+        body.extend(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+                name.replace('"', "")
+            )
+            .as_bytes(),
+        );
+        body.extend(data);
+        body.extend(b"\r\n");
+    }
+    body.extend(format!("--{boundary}--\r\n").as_bytes());
+    request(
+        "POST",
+        &format!("/channels/{channel}/messages"),
+        Some(token),
+    )
+    .set(
+        "Content-Type",
+        &format!("multipart/form-data; boundary={boundary}"),
+    )
+    .send_bytes(&body)
+    .map_err(describe)?;
     Ok(())
 }
 
 pub fn edit(token: &str, channel: &str, message: &str, content: &str) -> Result<(), String> {
-    ureq::patch(&format!("{BASE}/channels/{channel}/messages/{message}"))
-        .set("Authorization", token)
-        .send_json(serde_json::json!({ "content": content }))
-        .map_err(|e| e.to_string())?;
+    send_json(
+        "PATCH",
+        token,
+        &format!("/channels/{channel}/messages/{message}"),
+        json!({ "content": content }),
+    )?;
     Ok(())
 }
 
 pub fn delete(token: &str, channel: &str, message: &str) -> Result<(), String> {
-    ureq::delete(&format!("{BASE}/channels/{channel}/messages/{message}"))
-        .set("Authorization", token)
-        .call()
-        .map_err(|e| e.to_string())?;
+    request(
+        "DELETE",
+        &format!("/channels/{channel}/messages/{message}"),
+        Some(token),
+    )
+    .call()
+    .map_err(describe)?;
     Ok(())
 }
 
 pub fn typing(token: &str, channel: &str) -> Result<(), String> {
-    ureq::post(&format!("{BASE}/channels/{channel}/typing"))
-        .set("Authorization", token)
+    request("POST", &format!("/channels/{channel}/typing"), Some(token))
         .call()
-        .map_err(|e| e.to_string())?;
+        .map_err(describe)?;
+    Ok(())
+}
+
+/// Marks a channel as read up to a message (so other devices clear their badges).
+pub fn ack(token: &str, channel: &str, message: &str) -> Result<(), String> {
+    send_json(
+        "POST",
+        token,
+        &format!("/channels/{channel}/messages/{message}/ack"),
+        json!({ "token": null }),
+    )?;
     Ok(())
 }
 
@@ -336,25 +576,23 @@ pub fn react(
     emoji: &Emoji,
     add: bool,
 ) -> Result<(), String> {
-    let url = format!(
-        "{BASE}/channels/{channel}/messages/{message}/reactions/{}/@me",
+    let path = format!(
+        "/channels/{channel}/messages/{message}/reactions/{}/@me",
         percent_encode(&emoji.api_key())
     );
-    let req = if add {
-        ureq::put(&url)
-    } else {
-        ureq::delete(&url)
-    };
-    req.set("Authorization", token)
+    request(if add { "PUT" } else { "DELETE" }, &path, Some(token))
         .set("Content-Length", "0")
         .call()
-        .map_err(|e| e.to_string())?;
+        .map_err(describe)?;
     Ok(())
 }
 
 /// Downloads an image from the CDN (capped at 8 MiB).
 pub fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let resp = ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(8 * 1024 * 1024)
