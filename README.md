@@ -28,6 +28,9 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 - Slash commands: client-side `/shrug /tableflip /unflip /me /spoiler`, plus bot application commands via
   autocomplete (string / integer / number / boolean options; no sub-commands or user/channel options).
 - GIF picker (Discord's Tenor proxy) and a light theme (Réglages); preferences are saved in the config dir.
+- Responsive layout (side panel becomes an overlay under 1050 px; under 760 px the sidebar slides over the chat via ☰),
+  skeleton placeholders while avatars / images / messages / channels load, a "jump to latest" button, and clear
+  messages for missing permissions (HTTP 403: locked channel view, disabled composer).
 - Not implemented: voice, private threads, desktop notification sounds, sub-commands, GIF favourites.
   Several of these features (member list, presence, slash commands, GIF search, QR login) rely on
   undocumented endpoints reproduced from community docs and are untested here.

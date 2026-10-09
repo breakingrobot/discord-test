@@ -24,7 +24,7 @@ use api::{Channel, Emoji, Guild, GuildEmoji, Message, User};
 /// REST polling happens only while the gateway is down.
 const POLL_FAST: Duration = Duration::from_secs(4);
 const TYPING_TTL: Duration = Duration::from_secs(8);
-const MAX_INFLIGHT_IMAGES: usize = 8;
+const MAX_INFLIGHT_IMAGES: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -130,6 +130,14 @@ pub struct DiscordApp {
     member_roles: HashMap<String, Vec<String>>,
     presence: HashMap<String, String>,
     session_id: Option<String>,
+    /// Channels whose history we may not read / post in (HTTP 403).
+    forbidden: HashSet<String>,
+    no_send: HashSet<String>,
+    loading_messages: bool,
+    width: f32,
+    nav_open: bool,
+    status_at: Option<Instant>,
+    last_status_seen: String,
     threads: Vec<Channel>,
     forum_archived: HashMap<String, Vec<Channel>>,
     picker_tab: PickerTab,
@@ -179,6 +187,19 @@ pub struct DiscordApp {
     picker: Option<Picker>,
     switcher: Option<String>,
     switcher_sel: usize,
+}
+
+/// The text a keystroke types, if any. Space arrives as key "space" on some
+/// platforms with no `key_char`; AltGr (ctrl+alt) still types.
+fn typed(ks: &gpui::Keystroke) -> Option<String> {
+    if (ks.modifiers.control && !ks.modifiers.alt) || ks.modifiers.platform {
+        return None;
+    }
+    match (&ks.key_char, ks.key.as_str()) {
+        (Some(c), _) if !c.is_empty() && !c.chars().all(char::is_control) => Some(c.clone()),
+        (_, "space") => Some(" ".into()),
+        _ => None,
+    }
 }
 
 fn snowflake(id: &str) -> u64 {
@@ -233,6 +254,13 @@ impl DiscordApp {
             member_roles: HashMap::new(),
             presence: HashMap::new(),
             session_id: None,
+            forbidden: HashSet::new(),
+            no_send: HashSet::new(),
+            loading_messages: false,
+            width: 1280.0,
+            nav_open: false,
+            status_at: None,
+            last_status_seen: String::new(),
             threads: vec![],
             forum_archived: HashMap::new(),
             picker_tab: PickerTab::Emoji,
@@ -422,8 +450,8 @@ impl DiscordApp {
             "x" if cmd && ks.modifiers.shift => self.wrap_markers("~~"),
             "c" if cmd => cx.write_to_clipboard(ClipboardItem::new_string(self.input.clone())),
             _ if cmd => return,
-            _ => match &ks.key_char {
-                Some(ch) => self.insert(ch),
+            _ => match typed(ks) {
+                Some(ch) => self.insert(&ch),
                 None => return,
             },
         }
@@ -658,8 +686,8 @@ impl DiscordApp {
                 if ks.modifiers.control || ks.modifiers.platform {
                     return;
                 }
-                if let (Some(ch), Some(q)) = (&ks.key_char, &mut self.switcher) {
-                    q.push_str(ch);
+                if let (Some(ch), Some(q)) = (typed(ks), &mut self.switcher) {
+                    q.push_str(&ch);
                     self.switcher_sel = 0;
                 }
             }
@@ -681,8 +709,8 @@ impl DiscordApp {
                 if ks.modifiers.control || ks.modifiers.platform {
                     return;
                 }
-                if let (Some(ch), Some(q)) = (&ks.key_char, &mut self.search) {
-                    q.push_str(ch);
+                if let (Some(ch), Some(q)) = (typed(ks), &mut self.search) {
+                    q.push_str(&ch);
                 }
             }
         }
@@ -1070,8 +1098,8 @@ impl DiscordApp {
                 if ks.modifiers.control || ks.modifiers.platform {
                     return;
                 }
-                if let Some(ch) = &ks.key_char {
-                    self.gif_query.push_str(ch);
+                if let Some(ch) = typed(ks) {
+                    self.gif_query.push_str(&ch);
                 }
             }
         }
@@ -1128,6 +1156,11 @@ impl DiscordApp {
                 .await;
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
+                    if e.contains("(403)") {
+                        if let Some(c) = &this.channel {
+                            this.no_send.insert(c.id.clone());
+                        }
+                    }
                     this.status = format!("Échec de l'envoi : {e}");
                 }
                 this.last_msg_id = None;
@@ -1354,6 +1387,11 @@ impl DiscordApp {
                 .await;
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
+                    if e.contains("(403)") {
+                        if let Some(c) = &this.channel {
+                            this.no_send.insert(c.id.clone());
+                        }
+                    }
                     this.status = format!("Échec de l'envoi : {e}");
                 }
                 // Always jump to our own message.
@@ -1884,6 +1922,7 @@ impl DiscordApp {
     fn select_channel(&mut self, channel: Channel, cx: &mut Context<Self>) {
         self.reset_channel();
         self.unread.remove(&channel.id);
+        self.nav_open = false;
         self.channel = Some(channel);
         self.status.clear();
         if let Some(c) = self.channel.as_ref().filter(|c| c.is_forum()).cloned() {
@@ -1905,8 +1944,11 @@ impl DiscordApp {
         let Some(channel) = self.channel.clone() else {
             return;
         };
-        if channel.is_forum() {
+        if channel.is_forum() || self.forbidden.contains(&channel.id) {
             return;
+        }
+        if self.messages.is_empty() {
+            self.loading_messages = true;
         }
         let auth = self.auth.clone();
         let id = channel.id.clone();
@@ -1921,8 +1963,14 @@ impl DiscordApp {
                 }
                 match res {
                     Ok(fresh) => this.merge_messages(fresh, cx),
+                    Err(e) if e.contains("(403)") => {
+                        this.forbidden.insert(channel.id.clone());
+                        this.messages.clear();
+                        this.status.clear();
+                    }
                     Err(e) => this.status = format!("Messages indisponibles : {e}"),
                 }
+                this.loading_messages = false;
                 cx.notify();
             })
             .ok();
@@ -1989,9 +2037,11 @@ impl DiscordApp {
                 wanted.extend(user.avatar_url());
             }
         }
+        // Newest first: those are the ones on screen.
         for m in self
             .messages
             .iter()
+            .rev()
             .chain(&self.search_results)
             .chain(&self.pins)
         {
@@ -2079,6 +2129,22 @@ impl Render for DiscordApp {
             window.focus(&self.focus);
         }
         self.window_active = window.is_window_active();
+        self.width = f32::from(window.viewport_size().width);
+        if self.status != self.last_status_seen {
+            self.last_status_seen = self.status.clone();
+            self.status_at = Some(Instant::now());
+        } else if self.logged_in
+            && !self.status.is_empty()
+            && self
+                .status_at
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(8))
+        {
+            self.status.clear();
+            self.last_status_seen.clear();
+        }
+        if self.width >= 760. {
+            self.nav_open = false;
+        }
         self.ensure_images(cx);
         let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
         let title = if self.title_badge && mentions > 0 {
@@ -2100,6 +2166,7 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(360.), px(480.))),
                 ..Default::default()
             },
             |_, cx| cx.new(DiscordApp::new),

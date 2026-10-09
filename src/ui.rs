@@ -5,10 +5,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, AnyElement, Context,
-    Div, ExternalPaths, FontStyle, FontWeight, HighlightStyle, Image, InteractiveText,
-    KeyDownEvent, ObjectFit, SharedString, Stateful, StrikethroughStyle, StyledImage, StyledText,
-    UnderlineStyle,
+    div, img, linear_color_stop, linear_gradient, prelude::*, pulsating_between, px, rgb, rgba,
+    Animation, AnimationExt, AnyElement, Context, Div, ExternalPaths, FontStyle, FontWeight,
+    HighlightStyle, Image, InteractiveText, KeyDownEvent, ObjectFit, SharedString, Stateful,
+    StrikethroughStyle, StyledImage, StyledText, UnderlineStyle,
 };
 
 use crate::api::{Channel, Message, User};
@@ -152,6 +152,33 @@ fn stamp(t: &DateTime<Local>) -> String {
     } else {
         format!("{:02}/{:02}/{} {}", t.day(), t.month(), t.year(), hhmm(t))
     }
+}
+
+/// Pulsing placeholder block shown while content loads.
+fn skeleton(
+    id: impl Into<SharedString>,
+    w: Option<f32>,
+    h: f32,
+    radius: Option<f32>,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let base = div().h(px(h)).flex_shrink_0().bg(rgb(color::active()));
+    let base = match w {
+        Some(w) => base.w(px(w)),
+        None => base.w_full(),
+    };
+    let base = match radius {
+        Some(r) => base.rounded(px(r)),
+        None => base.rounded_full(),
+    };
+    base.with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(1400))
+            .repeat()
+            .with_easing(pulsating_between(0.35, 0.9)),
+        |d, v| d.opacity(v),
+    )
+    .into_any_element()
 }
 
 fn status_color(status: &str) -> Option<u32> {
@@ -428,7 +455,39 @@ fn rail_button(
 
 impl DiscordApp {
     pub fn root(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = if self.logged_in {
+        let narrow = self.width < 760.;
+        let body = if self.logged_in && narrow {
+            // Phone-like layout: chat only, navigation slides over it.
+            let nav = self.nav_open.then(|| {
+                div()
+                    .id("nav-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(0x00000080))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.nav_open = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("nav-panel")
+                            .h_full()
+                            .flex()
+                            .shadow_lg()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(self.rail(cx))
+                            .child(self.sidebar(cx)),
+                    )
+            });
+            div()
+                .size_full()
+                .relative()
+                .flex()
+                .child(self.chat(cx))
+                .children(nav)
+        } else if self.logged_in {
             div()
                 .size_full()
                 .flex()
@@ -476,7 +535,7 @@ impl DiscordApp {
             .child(
                 div()
                     .id("switcher")
-                    .w(px(560.))
+                    .w(px(560.0_f32.min(self.width - 32.)))
                     .h_full()
                     .max_h(px(420.))
                     .rounded(px(8.))
@@ -565,12 +624,20 @@ impl DiscordApp {
     }
 
     fn avatar(&self, u: &User, size: f32) -> AnyElement {
-        match u
-            .avatar_url()
-            .and_then(|url| self.images.get(&url).cloned())
-        {
-            Some(i) => round_image(i, size, None),
-            None => initials_avatar(&u.id, u.display_name(), size).into_any_element(),
+        let Some(url) = u.avatar_url() else {
+            return initials_avatar(&u.id, u.display_name(), size).into_any_element();
+        };
+        match self.images.get(&url) {
+            Some(i) => round_image(i.clone(), size, None),
+            None if self.image_failed.contains(&url) => {
+                initials_avatar(&u.id, u.display_name(), size).into_any_element()
+            }
+            None => skeleton(
+                format!("sk-av-{}-{}", u.id, size as u32),
+                Some(size),
+                size,
+                None,
+            ),
         }
     }
 
@@ -651,9 +718,11 @@ impl DiscordApp {
     // ---- login ---------------------------------------------------------
 
     fn login_view(&mut self, cx: &mut Context<Self>) -> Div {
-        let show_qr = self.login_mode != LoginMode::Mfa;
+        let show_qr = self.login_mode != LoginMode::Mfa && self.width >= 800.;
         let card = div()
-            .w(px(if show_qr { 820. } else { 480. }))
+            .w(px(
+                (if show_qr { 820.0_f32 } else { 480.0 }).min(self.width - 32.)
+            ))
             .p(px(32.))
             .rounded(px(8.))
             .bg(rgb(color::chat()))
@@ -1004,12 +1073,27 @@ impl DiscordApp {
 
         let rows: Vec<AnyElement> = if self.guild.is_none() {
             self.dm_rows(cx)
+        } else if self.channels.is_empty() {
+            (0..9)
+                .map(|i| {
+                    div()
+                        .px_2()
+                        .py(px(6.))
+                        .child(skeleton(
+                            format!("sk-ch-{i}"),
+                            Some([140., 100., 160., 120., 90., 150., 110., 130., 100.][i]),
+                            14.,
+                            Some(6.),
+                        ))
+                        .into_any_element()
+                })
+                .collect()
         } else {
             self.channel_rows(cx)
         };
 
         div()
-            .w(px(240.))
+            .w(px(if self.width < 900. { 200. } else { 240. }))
             .h_full()
             .flex_shrink_0()
             .bg(rgb(color::sidebar()))
@@ -1408,6 +1492,24 @@ impl DiscordApp {
             .gap_2()
             .border_b_1()
             .border_color(rgb(color::rail()))
+            .when(self.width < 760., |d| {
+                d.child(
+                    div()
+                        .id("nav-toggle")
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .text_size(px(18.))
+                        .cursor_pointer()
+                        .text_color(rgb(color::muted()))
+                        .hover(|d| d.bg(rgb(color::hover())))
+                        .child("☰")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.nav_open = !this.nav_open;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .text_size(px(22.))
@@ -1462,8 +1564,38 @@ impl DiscordApp {
                 ))
             });
 
-        let body: AnyElement = if self.channel.as_ref().is_some_and(|c| c.is_forum()) {
+        let forbidden = self
+            .channel
+            .as_ref()
+            .is_some_and(|c| self.forbidden.contains(&c.id));
+        let body: AnyElement = if forbidden {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_4()
+                .text_center()
+                .child(div().text_size(px(40.)).child("🔒"))
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(color::bright()))
+                        .child("Vous n'avez pas accès à ce salon"),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(color::muted()))
+                        .child("Vous n'avez pas la permission de voir les messages ici (403)."),
+                )
+                .into_any_element()
+        } else if self.channel.as_ref().is_some_and(|c| c.is_forum()) {
             self.forum_view(cx)
+        } else if self.channel.is_some() && self.loading_messages && self.messages.is_empty() {
+            self.messages_skeleton()
         } else if self.channel.is_some() {
             let older = (!self.history_done && self.messages.len() >= 50).then(|| {
                 div()
@@ -1486,18 +1618,51 @@ impl DiscordApp {
                     .on_click(cx.listener(|this, _, _, cx| this.load_older(cx)))
             });
             let rows = self.message_rows(cx);
+            let away = {
+                let max = self.scroll.max_offset().height;
+                max > px(0.) && self.scroll.offset().y < -max + px(160.)
+            };
+            let jump = away.then(|| {
+                div()
+                    .id("jump-bottom")
+                    .absolute()
+                    .bottom(px(12.))
+                    .right(px(24.))
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .bg(rgb(color::brand()))
+                    .shadow_lg()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(0xffffff))
+                    .child("Aller aux derniers messages ↓")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scroll.scroll_to_bottom();
+                        cx.notify();
+                    }))
+            });
             div()
-                .id("messages")
+                .relative()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll)
                 .flex()
                 .flex_col()
-                .children(older)
-                .child(self.welcome(prefix, &title))
-                .children(rows)
-                .child(div().h(px(16.)).flex_shrink_0())
+                .child(
+                    div()
+                        .id("messages")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .flex()
+                        .flex_col()
+                        .children(older)
+                        .child(self.welcome(prefix, &title))
+                        .children(rows)
+                        .child(div().h(px(16.)).flex_shrink_0()),
+                )
+                .children(jump)
                 .into_any_element()
         } else if self.guild.is_none() {
             self.friends_view(cx)
@@ -1531,7 +1696,27 @@ impl DiscordApp {
         let has_banner = banner.is_some();
         let slash = self.slash_popup(cx);
 
-        let composer = self.channel.is_some().then(|| {
+        let cannot_send = self
+            .channel
+            .as_ref()
+            .is_some_and(|c| self.no_send.contains(&c.id) || self.forbidden.contains(&c.id));
+        let locked = (self.channel.is_some() && cannot_send).then(|| {
+            div().px_4().pb(px(24.)).flex_shrink_0().child(
+                div()
+                    .min_h(px(44.))
+                    .px_4()
+                    .rounded(px(8.))
+                    .bg(rgb(color::input()))
+                    .opacity(0.7)
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(color::muted()))
+                    .child(
+                        "🔒  Vous n'avez pas la permission d'envoyer des messages dans ce salon.",
+                    ),
+            )
+        });
+        let composer = (self.channel.is_some() && !cannot_send).then(|| {
             div()
                 .px_4()
                 .flex_shrink_0()
@@ -1619,7 +1804,8 @@ impl DiscordApp {
                         .child(self.status.clone()),
                 )
             })
-            .children(composer);
+            .children(composer)
+            .children(locked);
 
         let picker = self.picker.is_some().then(|| self.emoji_picker(cx));
         div()
@@ -1634,10 +1820,58 @@ impl DiscordApp {
                 this.upload(paths.paths().to_vec(), cx)
             }))
             .child(main)
-            .when(self.show_side && self.channel.is_some(), |d| {
-                d.child(self.side_panel(cx))
-            })
+            .when(
+                self.show_side && self.channel.is_some() && self.width >= 1050.,
+                |d| d.child(self.side_panel(cx)),
+            )
+            .when(
+                self.show_side && self.channel.is_some() && self.width < 1050.,
+                |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .shadow_lg()
+                            .child(self.side_panel(cx)),
+                    )
+                },
+            )
             .children(picker)
+    }
+
+    fn messages_skeleton(&self) -> AnyElement {
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .p_4()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .gap_4()
+            .children((0..7).map(|i| {
+                let w1 = [110., 150., 90., 130., 170., 100., 140.][i % 7];
+                let w2: f32 = [380., 260., 460., 320., 220., 420., 300.][i % 7];
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(skeleton(format!("sk-m-av-{i}"), Some(40.), 40., None))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(skeleton(format!("sk-m-n-{i}"), Some(w1), 12., Some(6.)))
+                            .child(skeleton(
+                                format!("sk-m-t-{i}"),
+                                Some(w2.min(self.width - 160.)),
+                                14.,
+                                Some(6.),
+                            )),
+                    )
+            }))
+            .into_any_element()
     }
 
     fn picker_tabs(&self, cx: &mut Context<Self>) -> Div {
@@ -1844,7 +2078,7 @@ impl DiscordApp {
                     .absolute()
                     .right(px(24.))
                     .bottom(px(84.))
-                    .w(px(360.))
+                    .w(px(360.0_f32.min(self.width - 32.)))
                     .h(px(340.))
                     .rounded(px(8.))
                     .bg(rgb(color::sidebar()))
@@ -2349,7 +2583,7 @@ impl DiscordApp {
             .child(
                 div()
                     .id("profile")
-                    .w(px(360.))
+                    .w(px(360.0_f32.min(self.width - 32.)))
                     .rounded(px(8.))
                     .bg(rgb(color::sidebar()))
                     .shadow_lg()
@@ -2466,7 +2700,7 @@ impl DiscordApp {
             .child(
                 div()
                     .id("settings")
-                    .w(px(480.))
+                    .w(px(480.0_f32.min(self.width - 32.)))
                     .rounded(px(8.))
                     .bg(rgb(color::chat()))
                     .shadow_lg()
@@ -2732,18 +2966,15 @@ impl DiscordApp {
                     .rounded(px(8.))
                     .object_fit(ObjectFit::Contain)
                     .into_any_element(),
-                None => div()
-                    .w(px(w))
-                    .h(px(h))
-                    .rounded(px(8.))
+                None if self.image_failed.contains(&a.preview_url()) => div()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(4.))
                     .bg(rgb(color::sidebar()))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(rgb(color::muted()))
-                    .child("Chargement de l'image…")
+                    .text_color(rgb(color::link()))
+                    .child(a.filename.clone())
                     .into_any_element(),
+                None => skeleton(format!("sk-att-{}", a.url), Some(w), h, Some(8.)),
             };
         }
         div()

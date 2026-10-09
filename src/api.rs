@@ -307,9 +307,18 @@ fn describe(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
             let body: Value = resp.into_json().unwrap_or(Value::Null);
-            match body["message"].as_str() {
-                Some(m) => format!("{m} ({code})"),
-                None => format!("HTTP {code}"),
+            match code {
+                401 => "Session invalide ou expirée (401)".to_string(),
+                403 => "Vous n'avez pas la permission pour cette action (403)".to_string(),
+                404 => "Introuvable (404)".to_string(),
+                429 => format!(
+                    "Trop de requêtes, réessayez dans {} s (429)",
+                    body["retry_after"].as_f64().unwrap_or(5.0).ceil()
+                ),
+                _ => match body["message"].as_str() {
+                    Some(m) => format!("{m} ({code})"),
+                    None => format!("HTTP {code}"),
+                },
             }
         }
         other => other.to_string(),
