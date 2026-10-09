@@ -31,8 +31,15 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub enum MemberRow {
-    Group { id: String, count: u64 },
-    Member { user: User, status: String },
+    Group {
+        id: String,
+        count: u64,
+    },
+    Member {
+        user: User,
+        status: String,
+        roles: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -43,6 +50,18 @@ pub enum Event {
     },
     /// The member list changed in a way we don't patch incrementally.
     MembersStale {
+        guild_id: String,
+    },
+    /// Our session id (needed to run slash commands).
+    Session(String),
+    /// Initial presences of friends: (user id, status).
+    Presences(Vec<(String, String)>),
+    Presence {
+        user_id: String,
+        status: String,
+    },
+    /// A thread was created / updated / deleted in this guild.
+    ThreadsChanged {
         guild_id: String,
     },
     MessageCreate(Message),
@@ -250,6 +269,10 @@ fn run(
                     if tx.send(Event::Connected(true)).is_err() {
                         return Ok(());
                     }
+                    if let Some(id) = &session.id {
+                        let _ = tx.send(Event::Session(id.clone()));
+                    }
+                    let _ = tx.send(Event::Presences(ready_presences(&v["d"])));
                 } else if kind == "RESUMED" && tx.send(Event::Connected(true)).is_err() {
                     return Ok(());
                 }
@@ -263,6 +286,21 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// Friend presences from READY (shape differs between gateway versions).
+fn ready_presences(d: &Value) -> Vec<(String, String)> {
+    let lists = [&d["merged_presences"]["friends"], &d["presences"]];
+    let mut out = Vec::new();
+    for list in lists {
+        for p in list.as_array().into_iter().flatten() {
+            let id = p["user_id"].as_str().or_else(|| p["user"]["id"].as_str());
+            if let (Some(id), Some(st)) = (id, p["status"].as_str()) {
+                out.push((id.to_string(), st.to_string()));
+            }
+        }
+    }
+    out
 }
 
 fn dispatch(kind: &str, d: &Value) -> Option<Event> {
@@ -299,7 +337,14 @@ fn dispatch(kind: &str, d: &Value) -> Option<Event> {
                                 if let Some(nick) = m["nick"].as_str() {
                                     user.global_name = Some(nick.to_string());
                                 }
+                                let roles = m["roles"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|r| r.as_str().map(str::to_string))
+                                    .collect();
                                 rows.push(MemberRow::Member {
+                                    roles,
                                     user,
                                     status: m["presence"]["status"]
                                         .as_str()
@@ -317,6 +362,13 @@ fn dispatch(kind: &str, d: &Value) -> Option<Event> {
                 Event::MembersStale { guild_id }
             })
         }
+        "PRESENCE_UPDATE" => Some(Event::Presence {
+            user_id: d["user"]["id"].as_str().unwrap_or_default().to_string(),
+            status: s("status"),
+        }),
+        "THREAD_CREATE" | "THREAD_UPDATE" | "THREAD_DELETE" => Some(Event::ThreadsChanged {
+            guild_id: s("guild_id"),
+        }),
         "TYPING_START" => Some(Event::Typing {
             channel_id: s("channel_id"),
             user_id: s("user_id"),

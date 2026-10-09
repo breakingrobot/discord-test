@@ -71,9 +71,28 @@ pub struct Channel {
     pub topic: Option<String>,
     #[serde(default)]
     pub recipients: Vec<User>,
+    #[serde(default)]
+    pub message_count: Option<u32>,
+    #[serde(default)]
+    pub thread_metadata: Option<ThreadMeta>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ThreadMeta {
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Channel {
+    pub fn is_thread(&self) -> bool {
+        matches!(self.kind, 10..=12)
+    }
+
+    /// Forum / media channels list posts (threads) instead of messages.
+    pub fn is_forum(&self) -> bool {
+        matches!(self.kind, 15 | 16)
+    }
+
     pub fn is_dm(&self) -> bool {
         self.kind == 1 || self.kind == 3
     }
@@ -227,6 +246,25 @@ pub struct Message {
     pub mentions: Vec<User>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
+    /// Present on gateway events in guilds.
+    #[serde(default)]
+    pub member: Option<MemberPart>,
+    /// Thread started from this message.
+    #[serde(default)]
+    pub thread: Option<Box<Channel>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MemberPart {
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Role {
+    pub name: String,
+    pub color: u32,
+    pub position: i64,
 }
 
 /// Client fingerprint sent both as a header and in the gateway IDENTIFY.
@@ -380,7 +418,7 @@ pub fn guilds(token: &str) -> Result<Vec<Guild>, String> {
 /// Text/announcement channels and categories, in Discord's display order.
 pub fn channels(token: &str, guild: &str) -> Result<Vec<Channel>, String> {
     let mut chans: Vec<Channel> = get(token, &format!("/guilds/{guild}/channels"))?;
-    chans.retain(|c| matches!(c.kind, 0 | 4 | 5));
+    chans.retain(|c| matches!(c.kind, 0 | 4 | 5 | 15 | 16));
     chans.sort_by_key(|c| c.position);
     Ok(chans)
 }
@@ -630,16 +668,17 @@ pub fn guild_emojis(token: &str, guild: &str) -> Result<Vec<GuildEmoji>, String>
 }
 
 /// Role id -> name, used to label member-list groups.
-pub fn roles(
-    token: &str,
-    guild: &str,
-) -> Result<std::collections::HashMap<String, String>, String> {
+pub fn roles(token: &str, guild: &str) -> Result<std::collections::HashMap<String, Role>, String> {
     let v: Vec<Value> = get(token, &format!("/guilds/{guild}/roles"))?;
     Ok(v.into_iter()
         .filter_map(|r| {
             Some((
                 r["id"].as_str()?.to_string(),
-                r["name"].as_str()?.to_string(),
+                Role {
+                    name: r["name"].as_str()?.to_string(),
+                    color: r["color"].as_u64().unwrap_or(0) as u32,
+                    position: r["position"].as_i64().unwrap_or(0),
+                },
             ))
         })
         .collect())
@@ -675,4 +714,215 @@ pub fn search(
             serde_json::from_value(hit.clone()).ok()
         })
         .collect())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SlashOption {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// 3 string, 4 integer, 5 boolean, 10 number; 1/2 are sub-commands.
+    #[serde(rename = "type")]
+    pub kind: u8,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SlashCommand {
+    pub id: String,
+    pub application_id: String,
+    #[serde(default)]
+    pub version: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "type", default = "chat_input")]
+    pub kind: u8,
+    #[serde(default)]
+    pub options: Vec<SlashOption>,
+}
+
+fn chat_input() -> u8 {
+    1
+}
+
+/// Application commands available in a channel (+ application names).
+pub fn command_index(
+    token: &str,
+    channel: &str,
+) -> Result<(Vec<SlashCommand>, std::collections::HashMap<String, String>), String> {
+    let v: Value = get(
+        token,
+        &format!("/channels/{channel}/application-command-index"),
+    )?;
+    let cmds: Vec<SlashCommand> = v["application_commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| serde_json::from_value(c.clone()).ok())
+        .filter(|c: &SlashCommand| c.kind == 1)
+        .collect();
+    let apps = v["applications"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some((
+                a["id"].as_str()?.to_string(),
+                a["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    Ok((cmds, apps))
+}
+
+/// Runs a slash command (the reply arrives as a normal gateway message).
+pub fn run_command(
+    token: &str,
+    session_id: &str,
+    guild: Option<&str>,
+    channel: &str,
+    cmd: &SlashCommand,
+    options: Vec<Value>,
+) -> Result<(), String> {
+    let declared: Vec<Value> = cmd
+        .options
+        .iter()
+        .map(|o| json!({ "type": o.kind, "name": o.name, "description": o.description, "required": o.required }))
+        .collect();
+    let mut payload = json!({
+        "type": 2,
+        "application_id": cmd.application_id,
+        "channel_id": channel,
+        "session_id": session_id,
+        "data": {
+            "version": cmd.version, "id": cmd.id, "name": cmd.name, "type": 1,
+            "options": options,
+            "application_command": {
+                "id": cmd.id, "application_id": cmd.application_id, "version": cmd.version,
+                "type": 1, "name": cmd.name, "description": cmd.description,
+                "options": declared, "dm_permission": true, "nsfw": false,
+            },
+            "attachments": [],
+        },
+        "nonce": nonce(),
+        "analytics_location": "slash_ui",
+    });
+    if let Some(g) = guild {
+        payload["guild_id"] = json!(g);
+    }
+    let boundary = format!("----discordgpui{}", nonce());
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n{payload}\r\n--{boundary}--\r\n"
+    );
+    request("POST", "/interactions", Some(token))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send_bytes(body.as_bytes())
+        .map_err(describe)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct Gif {
+    pub title: String,
+    /// Page / media URL posted into the chat (Discord unfurls it).
+    pub url: String,
+    /// Still image for the grid.
+    pub preview: String,
+}
+
+/// Trending (empty query) or searched GIFs from Discord's Tenor proxy.
+pub fn gifs(token: &str, query: &str) -> Result<Vec<Gif>, String> {
+    let path = if query.trim().is_empty() {
+        "/gifs/trending-gifs?provider=tenor&locale=fr&limit=30&media_format=gif".to_string()
+    } else {
+        format!(
+            "/gifs/search?q={}&provider=tenor&locale=fr&limit=30&media_format=gif",
+            percent_encode(query.trim())
+        )
+    };
+    let v: Value = get(token, &path)?;
+    let list = v
+        .as_array()
+        .or_else(|| v["gifs"].as_array())
+        .ok_or("Réponse GIF inattendue")?;
+    Ok(list
+        .iter()
+        .filter_map(|g| {
+            let url = g["url"]
+                .as_str()
+                .or_else(|| g["gif_src"].as_str())?
+                .to_string();
+            let still = |k: &str| {
+                g[k].as_str()
+                    .filter(|u| {
+                        let u = u.split('?').next().unwrap_or(u);
+                        [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+                            .iter()
+                            .any(|e| u.ends_with(e))
+                    })
+                    .map(str::to_string)
+            };
+            let preview = still("preview").or_else(|| still("gif_src"))?;
+            Some(Gif {
+                title: g["title"].as_str().unwrap_or("GIF").to_string(),
+                url,
+                preview,
+            })
+        })
+        .collect())
+}
+
+fn threads_of(v: Value) -> Vec<Channel> {
+    v["threads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| serde_json::from_value(t.clone()).ok())
+        .collect()
+}
+
+pub fn active_threads(token: &str, guild: &str) -> Result<Vec<Channel>, String> {
+    Ok(threads_of(get(
+        token,
+        &format!("/guilds/{guild}/threads/active"),
+    )?))
+}
+
+pub fn archived_threads(token: &str, channel: &str) -> Result<Vec<Channel>, String> {
+    Ok(threads_of(get(
+        token,
+        &format!("/channels/{channel}/threads/archived/public?limit=25"),
+    )?))
+}
+
+pub fn start_thread(
+    token: &str,
+    channel: &str,
+    message: &str,
+    name: &str,
+) -> Result<Channel, String> {
+    send_json(
+        "POST",
+        token,
+        &format!("/channels/{channel}/messages/{message}/threads"),
+        json!({ "name": name, "auto_archive_duration": 1440 }),
+    )?
+    .into_json()
+    .map_err(|e| e.to_string())
+}
+
+pub fn forum_post(token: &str, forum: &str, title: &str, content: &str) -> Result<Channel, String> {
+    send_json(
+        "POST",
+        token,
+        &format!("/channels/{forum}/threads"),
+        json!({ "name": title, "auto_archive_duration": 1440, "message": { "content": content } }),
+    )?
+    .into_json()
+    .map_err(|e| e.to_string())
 }

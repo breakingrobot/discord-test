@@ -1,6 +1,8 @@
 mod api;
 mod emoji;
 mod gateway;
+mod notify;
+mod prefs;
 mod qr;
 mod store;
 mod ui;
@@ -59,6 +61,29 @@ pub enum Side {
     Pins,
 }
 
+/// One row of the slash-command autocomplete.
+#[derive(Clone)]
+pub struct SlashEntry {
+    pub name: String,
+    pub desc: String,
+    pub app: String,
+}
+
+/// Commands handled locally by the client (they just rewrite the message text).
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("shrug", "Ajoute ¯\\_(ツ)_/¯ à votre message"),
+    ("tableflip", "Ajoute (╯°□°)╯︵ ┻━┻ à votre message"),
+    ("unflip", "Ajoute ┬─┬ ノ( ゜-゜ノ) à votre message"),
+    ("me", "Met votre message en italique"),
+    ("spoiler", "Cache votre message derrière un spoiler"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PickerTab {
+    Emoji,
+    Gif,
+}
+
 pub enum Picker {
     Composer,
     React(Message),
@@ -101,11 +126,27 @@ pub struct DiscordApp {
     search_note: String,
     pins: Vec<Message>,
     members: Vec<gateway::MemberRow>,
-    roles: HashMap<String, String>,
+    roles: HashMap<String, api::Role>,
+    member_roles: HashMap<String, Vec<String>>,
+    presence: HashMap<String, String>,
+    session_id: Option<String>,
+    threads: Vec<Channel>,
+    forum_archived: HashMap<String, Vec<Channel>>,
+    picker_tab: PickerTab,
+    gif_query: String,
+    gif_typing: bool,
+    gifs: Vec<api::Gif>,
+    gif_note: String,
+    commands: HashMap<String, Vec<api::SlashCommand>>,
+    command_apps: HashMap<String, String>,
+    slash_sel: usize,
+    window_active: bool,
     guild_emojis: HashMap<String, Vec<GuildEmoji>>,
     profile: Option<User>,
     settings: bool,
     title_badge: bool,
+    light: bool,
+    notifications: bool,
     last_title: String,
     gateway_cmd: Option<flume::Sender<gateway::Command>>,
     last_member_req: Option<Instant>,
@@ -160,6 +201,8 @@ fn detect_format(b: &[u8]) -> Option<ImageFormat> {
 
 impl DiscordApp {
     fn new(cx: &mut Context<Self>) -> Self {
+        let prefs = prefs::load();
+        ui::color::set_light(prefs.light);
         let mut this = Self {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
@@ -179,7 +222,7 @@ impl DiscordApp {
             channel: None,
             collapsed: HashSet::new(),
             last_msg_id: None,
-            show_side: true,
+            show_side: prefs.show_side,
             side: Side::Members,
             search: None,
             search_results: vec![],
@@ -187,10 +230,26 @@ impl DiscordApp {
             pins: vec![],
             members: vec![],
             roles: HashMap::new(),
+            member_roles: HashMap::new(),
+            presence: HashMap::new(),
+            session_id: None,
+            threads: vec![],
+            forum_archived: HashMap::new(),
+            picker_tab: PickerTab::Emoji,
+            gif_query: String::new(),
+            gif_typing: false,
+            gifs: vec![],
+            gif_note: String::new(),
+            commands: HashMap::new(),
+            command_apps: HashMap::new(),
+            slash_sel: 0,
+            window_active: true,
             guild_emojis: HashMap::new(),
             profile: None,
             settings: false,
-            title_badge: true,
+            title_badge: prefs.title_badge,
+            light: prefs.light,
+            notifications: prefs.notifications,
             last_title: String::new(),
             gateway_cmd: None,
             last_member_req: None,
@@ -300,11 +359,36 @@ impl DiscordApp {
         if self.switcher.is_some() {
             return self.on_switcher_key(ev, cx);
         }
+        if self.picker.is_some() && self.picker_tab == PickerTab::Gif && self.gif_typing {
+            return self.on_gif_key(ev, cx);
+        }
         if self.search.is_some() {
             return self.on_search_key(ev, cx);
         }
         let len = self.input.chars().count();
         let before = self.input.len();
+        if self.logged_in {
+            let sugg = self.slash_suggestions();
+            if !sugg.is_empty() {
+                match ks.key.as_str() {
+                    "up" => {
+                        self.slash_sel = self.slash_sel.saturating_sub(1);
+                        return cx.notify();
+                    }
+                    "down" => {
+                        self.slash_sel = (self.slash_sel + 1).min(sugg.len() - 1);
+                        return cx.notify();
+                    }
+                    "tab" | "enter" => {
+                        let pick = &sugg[self.slash_sel.min(sugg.len() - 1)];
+                        self.set_input(format!("/{} ", pick.name));
+                        self.slash_sel = 0;
+                        return cx.notify();
+                    }
+                    _ => {}
+                }
+            }
+        }
         match ks.key.as_str() {
             "tab" if !self.logged_in => self.cycle_field(),
             "enter" if ks.modifiers.shift => self.insert("\n"),
@@ -346,10 +430,30 @@ impl DiscordApp {
         if self.input.len() > before {
             self.send_typing(cx);
         }
+        self.slash_sel = 0;
+        if self.input.starts_with('/') {
+            self.ensure_commands(cx);
+        }
         cx.notify();
     }
 
     // ---- login form ------------------------------------------------------
+
+    pub fn save_prefs(&self) {
+        prefs::save(&prefs::Prefs {
+            light: self.light,
+            notifications: self.notifications,
+            title_badge: self.title_badge,
+            show_side: self.show_side,
+        });
+    }
+
+    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.light = !self.light;
+        ui::color::set_light(self.light);
+        self.save_prefs();
+        cx.notify();
+    }
 
     fn sync_field(&mut self) {
         self.form[self.field as usize] = self.input.clone();
@@ -676,23 +780,363 @@ impl DiscordApp {
             guild_id: guild.clone(),
             channel_id: channel.id,
         });
-        if !self.roles.is_empty() || self.auth.starts_with("Bot ") {
-            return;
-        }
+    }
+
+    fn fetch_roles(&mut self, guild: String, cx: &mut Context<Self>) {
         let auth = self.auth.clone();
         cx.spawn(async move |this, cx| {
+            let g = guild.clone();
             if let Ok(r) = cx
-                .background_spawn(async move { api::roles(&auth, &guild) })
+                .background_spawn(async move { api::roles(&auth, &g) })
                 .await
             {
                 this.update(cx, |this, cx| {
-                    this.roles.extend(r);
+                    if this.guild.as_deref() == Some(&guild) {
+                        this.roles = r;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Colour of the member's highest coloured role, if any.
+    pub fn name_color(&self, user_id: &str) -> Option<u32> {
+        self.member_roles
+            .get(user_id)?
+            .iter()
+            .filter_map(|id| self.roles.get(id))
+            .filter(|r| r.color != 0)
+            .max_by_key(|r| r.position)
+            .map(|r| r.color)
+    }
+
+    pub fn refresh_threads(&mut self, cx: &mut Context<Self>) {
+        let Some(guild) = self.guild.clone() else {
+            return;
+        };
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let g = guild.clone();
+            if let Ok(t) = cx
+                .background_spawn(async move { api::active_threads(&auth, &g) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    if this.guild.as_deref() == Some(&guild) {
+                        this.threads = t;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn load_archived(&mut self, forum: String, cx: &mut Context<Self>) {
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let f = forum.clone();
+            if let Ok(t) = cx
+                .background_spawn(async move { api::archived_threads(&auth, &f) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.forum_archived.insert(forum, t);
                     cx.notify();
                 })
                 .ok();
             }
         })
         .detach();
+    }
+
+    /// Creates a thread from a message and opens it.
+    pub fn start_thread(&mut self, m: &Message, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let name: String = m
+            .content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        let name = if name.trim().is_empty() {
+            "Nouveau fil".to_string()
+        } else {
+            name
+        };
+        let (auth, mid) = (self.auth.clone(), m.id.clone());
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::start_thread(&auth, &channel.id, &mid, &name) })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(t) => {
+                        this.threads.push(t.clone());
+                        this.select_channel(t, cx);
+                    }
+                    Err(e) => this.status = format!("Création du fil impossible : {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fetches the channel's application commands the first time `/` is typed.
+    fn ensure_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        if self.commands.contains_key(&channel.id) || self.auth.starts_with("Bot ") {
+            return;
+        }
+        self.commands.insert(channel.id.clone(), vec![]);
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let cid = channel.id.clone();
+            let res = cx
+                .background_spawn(async move { api::command_index(&auth, &cid) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Ok((cmds, apps)) = res {
+                    this.commands.insert(channel.id, cmds);
+                    this.command_apps.extend(apps);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Autocomplete rows while the user is typing `/name` (before the first space).
+    pub fn slash_suggestions(&self) -> Vec<SlashEntry> {
+        let Some(rest) = self.input.strip_prefix('/') else {
+            return vec![];
+        };
+        if rest.contains(char::is_whitespace) || self.channel.is_none() {
+            return vec![];
+        }
+        let q = rest.to_lowercase();
+        let mut out: Vec<SlashEntry> = BUILTIN_COMMANDS
+            .iter()
+            .filter(|(n, _)| n.starts_with(&q))
+            .map(|(n, d)| SlashEntry {
+                name: n.to_string(),
+                desc: d.to_string(),
+                app: "Discord".into(),
+            })
+            .collect();
+        if let Some(list) = self.channel.as_ref().and_then(|c| self.commands.get(&c.id)) {
+            out.extend(
+                list.iter()
+                    .filter(|c| c.name.to_lowercase().contains(&q))
+                    .map(|c| SlashEntry {
+                        name: c.name.clone(),
+                        desc: c.description.clone(),
+                        app: self
+                            .command_apps
+                            .get(&c.application_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    }),
+            );
+        }
+        out.truncate(8);
+        out
+    }
+
+    /// Handles `/command args`. Returns the text to send as a plain message, or
+    /// `None` when the command was dispatched as an interaction (or failed).
+    fn handle_slash(&mut self, text: &str, cx: &mut Context<Self>) -> Option<String> {
+        let body = text.strip_prefix('/')?;
+        let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+        let args = args.trim();
+        match name {
+            "shrug" => return Some(format!("{args} ¯\\_(ツ)_/¯").trim().to_string()),
+            "tableflip" => return Some(format!("{args} (╯°□°)╯︵ ┻━┻").trim().to_string()),
+            "unflip" => return Some(format!("{args} ┬─┬ ノ( ゜-゜ノ)").trim().to_string()),
+            "me" => return Some(format!("_{args}_")),
+            "spoiler" => return Some(format!("||{args}||")),
+            _ => {}
+        }
+        let channel = self.channel.clone()?;
+        let cmd = self
+            .commands
+            .get(&channel.id)
+            .and_then(|l| l.iter().find(|c| c.name == name))
+            .cloned();
+        let Some(cmd) = cmd else {
+            return Some(text.to_string());
+        };
+        let Some(session) = self.session_id.clone() else {
+            self.status = "Session Gateway indisponible, réessayez dans un instant.".into();
+            return None;
+        };
+        if cmd.options.iter().any(|o| o.kind < 3 || o.kind > 10) {
+            self.status = format!("/{name} utilise des options non prises en charge.");
+            return None;
+        }
+        // Positional arguments: the last option takes the remainder.
+        let mut options = Vec::new();
+        let mut rest = args;
+        for (i, o) in cmd.options.iter().enumerate() {
+            let last = i + 1 == cmd.options.len();
+            let (tok, tail) = if last || o.kind != 3 {
+                match rest.split_once(char::is_whitespace) {
+                    Some((a, b)) if !last => (a, b.trim_start()),
+                    _ => (rest, ""),
+                }
+            } else {
+                rest.split_once(char::is_whitespace).unwrap_or((rest, ""))
+            };
+            rest = tail;
+            if tok.is_empty() {
+                if o.required {
+                    self.status = format!("Option requise manquante : {}", o.name);
+                    return None;
+                }
+                continue;
+            }
+            let value = match o.kind {
+                3 => serde_json::json!(tok),
+                4 => match tok.parse::<i64>() {
+                    Ok(n) => serde_json::json!(n),
+                    Err(_) => {
+                        self.status = format!("{} doit être un entier.", o.name);
+                        return None;
+                    }
+                },
+                10 => match tok.parse::<f64>() {
+                    Ok(n) => serde_json::json!(n),
+                    Err(_) => {
+                        self.status = format!("{} doit être un nombre.", o.name);
+                        return None;
+                    }
+                },
+                5 => serde_json::json!(matches!(tok, "true" | "oui" | "1")),
+                _ => {
+                    self.status = format!("L'option {} n'est pas prise en charge.", o.name);
+                    return None;
+                }
+            };
+            options.push(serde_json::json!({ "type": o.kind, "name": o.name, "value": value }));
+        }
+        let (auth, guild) = (self.auth.clone(), self.guild.clone());
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move {
+                    api::run_command(
+                        &auth,
+                        &session,
+                        guild.as_deref(),
+                        &channel.id,
+                        &cmd,
+                        options,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(e) = res {
+                    this.status = format!("Commande impossible : {e}");
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        None
+    }
+
+    fn on_gif_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => self.picker = None,
+            "backspace" => {
+                self.gif_query.pop();
+            }
+            "enter" => self.load_gifs(cx),
+            _ => {
+                if ks.modifiers.control || ks.modifiers.platform {
+                    return;
+                }
+                if let Some(ch) = &ks.key_char {
+                    self.gif_query.push_str(ch);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn open_gif_tab(&mut self, cx: &mut Context<Self>) {
+        self.picker_tab = PickerTab::Gif;
+        self.gif_typing = true;
+        if self.gifs.is_empty() {
+            self.load_gifs(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn load_gifs(&mut self, cx: &mut Context<Self>) {
+        let (auth, q) = (self.auth.clone(), self.gif_query.clone());
+        self.gif_note = "Chargement…".into();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::gifs(&auth, &q) })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(g) => {
+                        this.gif_note = if g.is_empty() {
+                            "Aucun GIF trouvé.".into()
+                        } else {
+                            String::new()
+                        };
+                        this.gifs = g;
+                    }
+                    Err(e) => this.gif_note = format!("GIF indisponibles : {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn send_gif(&mut self, url: String, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        self.picker = None;
+        let reply = self.replying.take().map(|m| m.id);
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(
+                    async move { api::send(&auth, &channel.id, &url, reply.as_deref()) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(e) = res {
+                    this.status = format!("Échec de l'envoi : {e}");
+                }
+                this.last_msg_id = None;
+                this.refresh_messages(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn pick_custom(&mut self, e: &GuildEmoji, cx: &mut Context<Self>) {
@@ -847,9 +1291,54 @@ impl DiscordApp {
         if text.is_empty() {
             return;
         }
+        if self.channel.is_none() {
+            return;
+        }
+        let mut text = text;
+        if self.editing.is_none() && text.starts_with('/') {
+            self.clear_input();
+            match self.handle_slash(&text, cx) {
+                Some(t) if !t.is_empty() => {
+                    self.set_input(t);
+                    text = self.input.clone();
+                    self.clear_input();
+                }
+                _ => return cx.notify(),
+            }
+        }
         let Some(channel) = self.channel.clone() else {
             return;
         };
+        if channel.is_forum() {
+            let (title, body) = match text.split_once('\n') {
+                Some((t, b)) if !b.trim().is_empty() => {
+                    (t.trim().to_string(), b.trim().to_string())
+                }
+                _ => (text.lines().next().unwrap_or("").to_string(), text.clone()),
+            };
+            self.clear_input();
+            let auth = self.auth.clone();
+            cx.spawn(async move |this, cx| {
+                let res = cx
+                    .background_spawn(
+                        async move { api::forum_post(&auth, &channel.id, &title, &body) },
+                    )
+                    .await;
+                this.update(cx, |this, cx| {
+                    match res {
+                        Ok(t) => {
+                            this.threads.push(t.clone());
+                            this.select_channel(t, cx);
+                        }
+                        Err(e) => this.status = format!("Publication impossible : {e}"),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return cx.notify();
+        }
         let auth = self.auth.clone();
         let editing = self.editing.take();
         let reply = self.replying.take().map(|m| m.id);
@@ -1125,7 +1614,30 @@ impl DiscordApp {
             }
             Members { guild_id, rows } => {
                 if self.guild.as_deref() == Some(&guild_id) {
+                    for r in &rows {
+                        if let gateway::MemberRow::Member {
+                            user,
+                            status,
+                            roles,
+                        } = r
+                        {
+                            self.member_roles.insert(user.id.clone(), roles.clone());
+                            self.presence
+                                .entry(user.id.clone())
+                                .or_insert_with(|| status.clone());
+                        }
+                    }
                     self.members = rows;
+                }
+            }
+            Session(id) => self.session_id = Some(id),
+            Presences(list) => self.presence.extend(list),
+            Presence { user_id, status } => {
+                self.presence.insert(user_id, status);
+            }
+            ThreadsChanged { guild_id } => {
+                if self.guild.as_deref() == Some(&guild_id) {
+                    self.refresh_threads(cx);
                 }
             }
             MembersStale { guild_id } => {
@@ -1138,6 +1650,34 @@ impl DiscordApp {
                 self.typing
                     .remove(&(m.channel_id.clone(), m.author.id.clone()));
                 let mine = self.me.as_ref().is_some_and(|u| u.id == m.author.id);
+                if let Some(member) = &m.member {
+                    self.member_roles
+                        .insert(m.author.id.clone(), member.roles.clone());
+                }
+                let viewing = self.channel.as_ref().map(|c| &c.id) == Some(&m.channel_id);
+                if !mine && self.notifications && (!viewing || !self.window_active) {
+                    let me = self.me.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+                    let pinged = m.guild_id.is_none()
+                        || m.mention_everyone
+                        || m.mentions.iter().any(|u| u.id == me);
+                    if pinged {
+                        let place = match &m.guild_id {
+                            None => "message privé".to_string(),
+                            Some(g) => self
+                                .guilds
+                                .iter()
+                                .find(|x| &x.id == g)
+                                .map(|x| x.name.clone())
+                                .unwrap_or_default(),
+                        };
+                        let body = if m.content.is_empty() {
+                            "(pièce jointe)".to_string()
+                        } else {
+                            m.content.clone()
+                        };
+                        notify::show(&format!("{} · {place}", m.author.display_name()), &body);
+                    }
+                }
                 if self.channel.as_ref().map(|c| &c.id) == Some(&m.channel_id) {
                     if !self.messages.iter().any(|x| x.id == m.id) {
                         self.follow_if_at_bottom();
@@ -1286,6 +1826,10 @@ impl DiscordApp {
         self.guild = Some(id.clone());
         self.channels.clear();
         self.members.clear();
+        self.threads.clear();
+        self.roles.clear();
+        self.member_roles.clear();
+        self.fetch_roles(id.clone(), cx);
         self.reset_channel();
         let auth = self.auth.clone();
         if !self.guild_emojis.contains_key(&id) {
@@ -1317,7 +1861,13 @@ impl DiscordApp {
                 match res {
                     Ok(c) => {
                         this.channels = c;
-                        if let Some(first) = this.channels.iter().find(|c| c.kind != 4).cloned() {
+                        this.refresh_threads(cx);
+                        if let Some(first) = this
+                            .channels
+                            .iter()
+                            .find(|c| !c.is_forum() && c.kind != 4)
+                            .cloned()
+                        {
                             this.select_channel(first, cx);
                         }
                     }
@@ -1336,6 +1886,9 @@ impl DiscordApp {
         self.unread.remove(&channel.id);
         self.channel = Some(channel);
         self.status.clear();
+        if let Some(c) = self.channel.as_ref().filter(|c| c.is_forum()).cloned() {
+            self.load_archived(c.id, cx);
+        }
         self.search = None;
         self.search_results.clear();
         self.search_note.clear();
@@ -1352,6 +1905,9 @@ impl DiscordApp {
         let Some(channel) = self.channel.clone() else {
             return;
         };
+        if channel.is_forum() {
+            return;
+        }
         let auth = self.auth.clone();
         let id = channel.id.clone();
         cx.spawn(async move |this, cx| {
@@ -1414,6 +1970,9 @@ impl DiscordApp {
                 .flat_map(|c| &c.recipients)
                 .filter_map(|u| u.avatar_url()),
         );
+        if self.picker.is_some() && self.picker_tab == PickerTab::Gif {
+            wanted.extend(self.gifs.iter().map(|g| g.preview.clone()));
+        }
         if self.picker.is_some() {
             if let Some(g) = &self.guild {
                 wanted.extend(
@@ -1519,6 +2078,7 @@ impl Render for DiscordApp {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
+        self.window_active = window.is_window_active();
         self.ensure_images(cx);
         let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
         let title = if self.title_badge && mentions > 0 {

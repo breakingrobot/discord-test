@@ -20,8 +20,17 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 - Search (Ctrl+F or "Rechercher"), pinned messages, real server member list with presence and role groups
   (via the gateway's member-list subscription, user accounts only), server custom emojis in the picker,
   profile popup (click an avatar or member), settings panel, mention count in the window title.
-- Not implemented: voice, threads, forum channels, desktop notifications, friend presence, role colours,
-  GIF picker, slash commands, light theme.
+- Threads (sidebar, "Fil" action, thread chip under messages) and forum / media channels (post list with
+  archived posts, create a post from the composer: title, Shift+Enter, message).
+- Friend presence (online / idle / do-not-disturb) in the friends list and DM list; role colours on names.
+- Desktop notifications for mentions and DMs when the window is unfocused or the channel is not open
+  (PowerShell toast on Windows, `notify-send` on Linux, `osascript` on macOS; toggle in Réglages).
+- Slash commands: client-side `/shrug /tableflip /unflip /me /spoiler`, plus bot application commands via
+  autocomplete (string / integer / number / boolean options; no sub-commands or user/channel options).
+- GIF picker (Discord's Tenor proxy) and a light theme (Réglages); preferences are saved in the config dir.
+- Not implemented: voice, private threads, desktop notification sounds, sub-commands, GIF favourites.
+  Several of these features (member list, presence, slash commands, GIF search, QR login) rely on
+  undocumented endpoints reproduced from community docs and are untested here.
 - Using a user account with a third-party client is against Discord's Terms of Service (account risk is yours).
   QR and password login follow community-documented protocols and have not been verified against Discord here.
 

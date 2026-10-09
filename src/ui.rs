@@ -13,24 +13,105 @@ use gpui::{
 
 use crate::api::{Channel, Message, User};
 use crate::gateway::MemberRow;
-use crate::{DiscordApp, Field, LoginMode, Picker, QrState, Side};
+use crate::{DiscordApp, Field, LoginMode, Picker, PickerTab, QrState, Side};
 
-mod color {
-    pub const RAIL: u32 = 0x1e1f22;
-    pub const SIDEBAR: u32 = 0x2b2d31;
-    pub const PANEL: u32 = 0x232428;
-    pub const CHAT: u32 = 0x313338;
-    pub const INPUT: u32 = 0x383a40;
-    pub const HOVER: u32 = 0x35373c;
-    pub const ACTIVE: u32 = 0x404249;
-    pub const BRAND: u32 = 0x5865f2;
-    pub const GREEN: u32 = 0x23a55a;
-    pub const RED: u32 = 0xf23f42;
-    pub const TEXT: u32 = 0xdbdee1;
-    pub const BRIGHT: u32 = 0xf2f3f5;
-    pub const MUTED: u32 = 0x949ba4;
-    pub const LINK: u32 = 0x00a8fc;
-    pub const DIVIDER: u32 = 0x3f4147;
+/// Theme palette: dark by default, light when `set_light(true)`.
+pub mod color {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static LIGHT: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_light(on: bool) {
+        LIGHT.store(on, Ordering::Relaxed);
+    }
+
+    pub fn is_light() -> bool {
+        LIGHT.load(Ordering::Relaxed)
+    }
+
+    fn pick(dark: u32, light: u32) -> u32 {
+        if is_light() {
+            light
+        } else {
+            dark
+        }
+    }
+
+    pub fn rail() -> u32 {
+        pick(0x1e1f22, 0xe3e5e8)
+    }
+
+    pub fn sidebar() -> u32 {
+        pick(0x2b2d31, 0xf2f3f5)
+    }
+
+    pub fn panel() -> u32 {
+        pick(0x232428, 0xebedef)
+    }
+
+    pub fn chat() -> u32 {
+        pick(0x313338, 0xffffff)
+    }
+
+    pub fn input() -> u32 {
+        pick(0x383a40, 0xebedef)
+    }
+
+    pub fn hover() -> u32 {
+        pick(0x35373c, 0xdfe1e5)
+    }
+
+    pub fn active() -> u32 {
+        pick(0x404249, 0xd1d3d8)
+    }
+
+    pub fn brand() -> u32 {
+        pick(0x5865f2, 0x5865f2)
+    }
+
+    pub fn green() -> u32 {
+        pick(0x23a55a, 0x23a55a)
+    }
+
+    pub fn red() -> u32 {
+        pick(0xf23f42, 0xd83c3e)
+    }
+
+    pub fn text() -> u32 {
+        pick(0xdbdee1, 0x2e3338)
+    }
+
+    pub fn bright() -> u32 {
+        pick(0xf2f3f5, 0x060607)
+    }
+
+    pub fn muted() -> u32 {
+        pick(0x949ba4, 0x5c5e66)
+    }
+
+    pub fn link() -> u32 {
+        pick(0x00a8fc, 0x006ce7)
+    }
+
+    pub fn divider() -> u32 {
+        pick(0x3f4147, 0xd7d9dd)
+    }
+
+    pub fn msg_hover() -> u32 {
+        pick(0x2e3035, 0xf7f7f8)
+    }
+
+    pub fn ping_bg() -> u32 {
+        pick(0x444037, 0xfff6dc)
+    }
+
+    pub fn react_me() -> u32 {
+        pick(0x3b405a, 0xe3e6fc)
+    }
+
+    pub fn code_bg() -> u32 {
+        pick(0x1e1f22, 0xe3e5e8)
+    }
 }
 
 const AVATARS: [u32; 6] = [0x5865f2, 0x747f8d, 0x3ba55c, 0xfaa81a, 0xed4245, 0xeb459e];
@@ -70,6 +151,24 @@ fn stamp(t: &DateTime<Local>) -> String {
         format!("Hier à {}", hhmm(t))
     } else {
         format!("{:02}/{:02}/{} {}", t.day(), t.month(), t.year(), hhmm(t))
+    }
+}
+
+fn status_color(status: &str) -> Option<u32> {
+    match status {
+        "online" => Some(color::green()),
+        "idle" => Some(0xf0b232),
+        "dnd" => Some(color::red()),
+        _ => None,
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "online" => "En ligne",
+        "idle" => "Absent",
+        "dnd" => "Ne pas déranger",
+        _ => "Hors ligne",
     }
 }
 
@@ -153,7 +252,7 @@ fn markdown(src: &str, keep_markers: bool) -> (String, Vec<(Range<usize>, Highli
         ..Default::default()
     };
     let code = HighlightStyle {
-        background_color: Some(rgb(0x1e1f22).into()),
+        background_color: Some(rgb(color::code_bg()).into()),
         ..Default::default()
     };
     let under = HighlightStyle {
@@ -172,7 +271,7 @@ fn markdown(src: &str, keep_markers: bool) -> (String, Vec<(Range<usize>, Highli
         ..Default::default()
     };
     let link = HighlightStyle {
-        color: Some(rgb(color::LINK).into()),
+        color: Some(rgb(color::link()).into()),
         underline: Some(UnderlineStyle {
             thickness: px(1.),
             color: None,
@@ -248,7 +347,7 @@ fn mention_pill(count: u32) -> Div {
         .h(px(18.))
         .px(px(5.))
         .rounded_full()
-        .bg(rgb(color::RED))
+        .bg(rgb(color::red()))
         .flex()
         .items_center()
         .justify_center()
@@ -267,9 +366,9 @@ fn badge(count: u32) -> Div {
         .h(px(18.))
         .px(px(5.))
         .rounded_full()
-        .bg(rgb(color::RED))
+        .bg(rgb(color::red()))
         .border_2()
-        .border_color(rgb(color::RAIL))
+        .border_color(rgb(color::rail()))
         .flex()
         .items_center()
         .justify_center()
@@ -295,7 +394,7 @@ fn rail_slot(button: Stateful<Div>, active: bool, unread: bool, mentions: u32) -
                 .w(px(4.))
                 .h(px(if tall { 40. } else { 8. }))
                 .rounded_md()
-                .bg(rgb(color::BRIGHT))
+                .bg(rgb(color::bright()))
                 .when(!active && !unread, |d| d.opacity(0.)),
         )
         .child(button)
@@ -315,15 +414,15 @@ fn rail_button(
     base.flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(color::BRIGHT))
+        .text_color(rgb(color::bright()))
         .font_weight(FontWeight::SEMIBOLD)
         .text_size(px(15.))
         .child(label)
-        .when(active, |d| d.rounded(px(16.)).bg(rgb(color::BRAND)))
+        .when(active, |d| d.rounded(px(16.)).bg(rgb(color::brand())))
         .when(!active, |d| {
             d.rounded_full()
-                .bg(rgb(color::CHAT))
-                .hover(|h| h.rounded(px(16.)).bg(rgb(color::BRAND)))
+                .bg(rgb(color::chat()))
+                .hover(|h| h.rounded(px(16.)).bg(rgb(color::brand())))
         })
 }
 
@@ -348,7 +447,7 @@ impl DiscordApp {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
             .relative()
             .size_full()
-            .text_color(rgb(color::TEXT))
+            .text_color(rgb(color::text()))
             .text_size(px(15.))
             .child(body)
             .children(profile)
@@ -381,7 +480,7 @@ impl DiscordApp {
                     .h_full()
                     .max_h(px(420.))
                     .rounded(px(8.))
-                    .bg(rgb(color::CHAT))
+                    .bg(rgb(color::chat()))
                     .shadow_lg()
                     .p_3()
                     .flex()
@@ -393,14 +492,14 @@ impl DiscordApp {
                             .h(px(44.))
                             .px_3()
                             .rounded(px(4.))
-                            .bg(rgb(color::RAIL))
+                            .bg(rgb(color::rail()))
                             .flex()
                             .items_center()
                             .text_size(px(18.))
                             .child(if query.is_empty() {
                                 div().flex().items_center().child(Self::caret()).child(
                                     div()
-                                        .text_color(rgb(color::MUTED))
+                                        .text_color(rgb(color::muted()))
                                         .child("Où voulez-vous aller ?"),
                                 )
                             } else {
@@ -421,9 +520,9 @@ impl DiscordApp {
                             .items_center()
                             .cursor_pointer()
                             .when(i == sel, |d| {
-                                d.bg(rgb(color::ACTIVE)).text_color(rgb(color::BRIGHT))
+                                d.bg(rgb(color::active())).text_color(rgb(color::bright()))
                             })
-                            .hover(|d| d.bg(rgb(color::HOVER)))
+                            .hover(|d| d.bg(rgb(color::hover())))
                             .child(label)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.go(target.clone(), cx)),
@@ -433,7 +532,7 @@ impl DiscordApp {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(color::MUTED))
+                            .text_color(rgb(color::muted()))
                             .child("↑↓ naviguer · Entrée ouvrir · Échap fermer · Ctrl+K"),
                     ),
             )
@@ -443,6 +542,27 @@ impl DiscordApp {
     // ---- text input ----------------------------------------------------
 
     // ---- text input ----------------------------------------------------
+
+    /// Avatar with a presence dot (when the user is online / idle / dnd).
+    fn avatar_status(&self, u: &User, size: f32, ring: u32) -> AnyElement {
+        let dot = self.presence.get(&u.id).and_then(|s| status_color(s));
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(self.avatar(u, size))
+            .children(dot.map(|c| {
+                div()
+                    .absolute()
+                    .right(px(-2.))
+                    .bottom(px(-2.))
+                    .size(px(size * 0.36))
+                    .rounded_full()
+                    .bg(rgb(c))
+                    .border_2()
+                    .border_color(rgb(ring))
+            }))
+            .into_any_element()
+    }
 
     fn avatar(&self, u: &User, size: f32) -> AnyElement {
         match u
@@ -462,7 +582,7 @@ impl DiscordApp {
                 .flex()
                 .items_center()
                 .child(Self::caret())
-                .child(div().text_color(rgb(color::MUTED)).child(placeholder));
+                .child(div().text_color(rgb(color::muted())).child(placeholder));
         }
         let text: String = if mask {
             self.input
@@ -525,7 +645,7 @@ impl DiscordApp {
             .w(px(2.))
             .h(px(20.))
             .flex_shrink_0()
-            .bg(rgb(color::BRIGHT))
+            .bg(rgb(color::bright()))
     }
 
     // ---- login ---------------------------------------------------------
@@ -536,7 +656,7 @@ impl DiscordApp {
             .w(px(if show_qr { 820. } else { 480. }))
             .p(px(32.))
             .rounded(px(8.))
-            .bg(rgb(color::CHAT))
+            .bg(rgb(color::chat()))
             .shadow_lg()
             .flex()
             .gap(px(48.))
@@ -582,7 +702,7 @@ impl DiscordApp {
                 div()
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child(label),
             )
             .child(
@@ -591,9 +711,13 @@ impl DiscordApp {
                     .h(px(40.))
                     .px_3()
                     .rounded(px(3.))
-                    .bg(rgb(color::RAIL))
+                    .bg(rgb(color::rail()))
                     .border_2()
-                    .border_color(rgb(if active { color::BRAND } else { color::RAIL }))
+                    .border_color(rgb(if active {
+                        color::brand()
+                    } else {
+                        color::rail()
+                    }))
                     .flex()
                     .items_center()
                     .overflow_hidden()
@@ -616,7 +740,7 @@ impl DiscordApp {
         div()
             .id(id)
             .text_sm()
-            .text_color(rgb(color::LINK))
+            .text_color(rgb(color::link()))
             .cursor_pointer()
             .hover(|d| d.underline())
             .child(label)
@@ -648,10 +772,10 @@ impl DiscordApp {
                     div()
                         .text_size(px(24.))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(color::BRIGHT))
+                        .text_color(rgb(color::bright()))
                         .child(title),
                 )
-                .child(div().text_color(rgb(color::MUTED)).child(sub)),
+                .child(div().text_color(rgb(color::muted())).child(sub)),
         );
         form = match self.login_mode {
             LoginMode::Credentials => form
@@ -665,7 +789,7 @@ impl DiscordApp {
             form = form.child(
                 div()
                     .text_sm()
-                    .text_color(rgb(if busy { color::MUTED } else { color::RED }))
+                    .text_color(rgb(if busy { color::muted() } else { color::red() }))
                     .child(self.status.clone()),
             );
         }
@@ -678,7 +802,7 @@ impl DiscordApp {
                 .id("login")
                 .h(px(44.))
                 .rounded(px(3.))
-                .bg(rgb(color::BRAND))
+                .bg(rgb(color::brand()))
                 .hover(|h| h.bg(rgb(0x4752c4)))
                 .cursor_pointer()
                 .flex()
@@ -707,7 +831,7 @@ impl DiscordApp {
         form.child(footer).child(
             div()
                 .text_xs()
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .child("Votre session est enregistrée dans le trousseau du système."),
         )
     }
@@ -736,13 +860,13 @@ impl DiscordApp {
             _ => div()
                 .size(px(SIZE + 24.))
                 .rounded(px(8.))
-                .bg(rgb(color::SIDEBAR))
+                .bg(rgb(color::sidebar()))
                 .flex()
                 .items_center()
                 .justify_center()
                 .px_4()
                 .text_sm()
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .child(match &self.qr {
                     QrState::Failed(e) => e.clone(),
                     QrState::Scanned(_) => "Code scanné".to_string(),
@@ -767,7 +891,7 @@ impl DiscordApp {
                 .px_3()
                 .py_1()
                 .rounded(px(3.))
-                .bg(rgb(color::BRAND))
+                .bg(rgb(color::brand()))
                 .cursor_pointer()
                 .text_sm()
                 .text_color(rgb(0xffffff))
@@ -787,10 +911,10 @@ impl DiscordApp {
                 div()
                     .text_size(px(20.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(color::BRIGHT))
+                    .text_color(rgb(color::bright()))
                     .child(title),
             )
-            .child(div().text_sm().text_color(rgb(color::MUTED)).child(text))
+            .child(div().text_sm().text_color(rgb(color::muted())).child(text))
             .children(refresh)
     }
 
@@ -835,7 +959,7 @@ impl DiscordApp {
             .w(px(72.))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(color::RAIL))
+            .bg(rgb(color::rail()))
             .py_3()
             .flex()
             .flex_col()
@@ -848,7 +972,7 @@ impl DiscordApp {
                     .w(px(32.))
                     .h(px(2.))
                     .rounded_md()
-                    .bg(rgb(color::DIVIDER)),
+                    .bg(rgb(color::divider())),
             )
             .children(guilds)
     }
@@ -872,8 +996,8 @@ impl DiscordApp {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(rgb(color::RAIL))
-            .text_color(rgb(color::BRIGHT))
+            .border_color(rgb(color::rail()))
+            .text_color(rgb(color::bright()))
             .font_weight(FontWeight::SEMIBOLD)
             .overflow_hidden()
             .child(header_title);
@@ -888,7 +1012,7 @@ impl DiscordApp {
             .w(px(240.))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(color::SIDEBAR))
+            .bg(rgb(color::sidebar()))
             .flex()
             .flex_col()
             .child(header)
@@ -919,12 +1043,12 @@ impl DiscordApp {
                 .gap_3()
                 .cursor_pointer()
                 .text_color(rgb(if friends_active {
-                    color::BRIGHT
+                    color::bright()
                 } else {
-                    color::MUTED
+                    color::muted()
                 }))
-                .when(friends_active, |d| d.bg(rgb(color::ACTIVE)))
-                .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+                .when(friends_active, |d| d.bg(rgb(color::active())))
+                .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
                 .child(div().w(px(32.)).flex().justify_center().child("👥"))
                 .child("Amis")
                 .on_click(cx.listener(|this, _, _, cx| this.open_home(cx)))
@@ -935,7 +1059,7 @@ impl DiscordApp {
                 .pb_1()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .child("MESSAGES PRIVÉS")
                 .into_any_element(),
         ];
@@ -944,6 +1068,7 @@ impl DiscordApp {
             let chan = c.clone();
             let title = c.title();
             let pic = match c.recipients.first() {
+                Some(u) if c.recipients.len() == 1 => self.avatar_status(u, 32., color::sidebar()),
                 Some(u) => self.avatar(u, 32.),
                 None => initials_avatar(&c.id, &title, 32.).into_any_element(),
             };
@@ -959,10 +1084,14 @@ impl DiscordApp {
                     .items_center()
                     .gap_3()
                     .cursor_pointer()
-                    .text_color(rgb(if bright { color::BRIGHT } else { color::MUTED }))
+                    .text_color(rgb(if bright {
+                        color::bright()
+                    } else {
+                        color::muted()
+                    }))
                     .when(unread.is_some(), |d| d.font_weight(FontWeight::SEMIBOLD))
-                    .when(active, |d| d.bg(rgb(color::ACTIVE)))
-                    .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+                    .when(active, |d| d.bg(rgb(color::active())))
+                    .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
                     .child(pic)
                     .child(div().flex_1().overflow_hidden().child(title))
                     .children(
@@ -988,6 +1117,7 @@ impl DiscordApp {
             .filter(|c| c.kind != 4 && c.parent_id.is_none());
         for c in loose {
             rows.push(self.channel_row(c, cx));
+            rows.extend(self.thread_rows(&c.id, cx));
         }
         for cat in categories {
             let collapsed = self.collapsed.contains(&cat.id);
@@ -1003,8 +1133,8 @@ impl DiscordApp {
                     .cursor_pointer()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::MUTED))
-                    .hover(|d| d.text_color(rgb(color::BRIGHT)))
+                    .text_color(rgb(color::muted()))
+                    .hover(|d| d.text_color(rgb(color::bright())))
                     .child(if collapsed { "›" } else { "⌄" })
                     .child(cat.title().to_uppercase())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1024,9 +1154,129 @@ impl DiscordApp {
                 .filter(|c| c.parent_id.as_deref() == Some(&cat.id))
             {
                 rows.push(self.channel_row(c, cx));
+                rows.extend(self.thread_rows(&c.id, cx));
             }
         }
         rows
+    }
+
+    /// Active threads under a channel, indented in the sidebar.
+    fn thread_rows(&self, parent: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.threads
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some(parent))
+            .filter(|t| !self.channels.iter().any(|c| c.id == parent && c.is_forum()))
+            .map(|t| {
+                let chan = t.clone();
+                let active = self.channel.as_ref().map(|s| &s.id) == Some(&t.id);
+                let unread = self.unread.contains_key(&t.id);
+                div()
+                    .id(SharedString::from(format!("t-{}", t.id)))
+                    .h(px(28.))
+                    .ml(px(18.))
+                    .px_2()
+                    .rounded(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(if active || unread {
+                        color::bright()
+                    } else {
+                        color::muted()
+                    }))
+                    .when(active, |d| d.bg(rgb(color::active())))
+                    .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
+                    .child("⤷")
+                    .child(div().flex_1().overflow_hidden().child(t.title()))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn forum_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(forum) = &self.channel else {
+            return div().into_any_element();
+        };
+        let mut posts: Vec<Channel> = self
+            .threads
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some(&forum.id))
+            .cloned()
+            .collect();
+        for t in self.forum_archived.get(&forum.id).into_iter().flatten() {
+            if !posts.iter().any(|p| p.id == t.id) {
+                posts.push(t.clone());
+            }
+        }
+        posts.sort_by_key(|p| std::cmp::Reverse(p.id.parse::<u64>().unwrap_or(0)));
+        let mut list = div()
+            .id("forum")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(color::bright()))
+                    .child("Publications"),
+            )
+            .child(div().text_sm().text_color(rgb(color::muted())).child(
+                "Écrivez le titre, Maj+Entrée, puis le message, pour créer une publication.",
+            ));
+        if posts.is_empty() {
+            list = list.child(
+                div()
+                    .mt_4()
+                    .text_color(rgb(color::muted()))
+                    .child("Aucune publication pour le moment."),
+            );
+        }
+        for p in posts {
+            let archived = p.thread_metadata.as_ref().is_some_and(|m| m.archived);
+            let count = p.message_count.unwrap_or(0);
+            let chan = p.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("post-{}", p.id)))
+                    .p_3()
+                    .rounded(px(8.))
+                    .bg(rgb(color::sidebar()))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(color::bright()))
+                            .child(p.title()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color::muted()))
+                            .child(format!(
+                                "{count} message{}{}",
+                                if count > 1 { "s" } else { "" },
+                                if archived { " · Archivé" } else { "" }
+                            )),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
+                    ),
+            );
+        }
+        list.into_any_element()
     }
 
     fn channel_row(&self, c: &Channel, cx: &mut Context<Self>) -> AnyElement {
@@ -1043,11 +1293,19 @@ impl DiscordApp {
             .items_center()
             .gap(px(6.))
             .cursor_pointer()
-            .text_color(rgb(if bright { color::BRIGHT } else { color::MUTED }))
+            .text_color(rgb(if bright {
+                color::bright()
+            } else {
+                color::muted()
+            }))
             .when(unread.is_some(), |d| d.font_weight(FontWeight::SEMIBOLD))
-            .when(active, |d| d.bg(rgb(color::ACTIVE)))
-            .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
-            .child(div().text_size(px(20.)).child("#"))
+            .when(active, |d| d.bg(rgb(color::active())))
+            .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .child(if c.is_forum() { "▤" } else { "#" }),
+            )
             .child(div().flex_1().overflow_hidden().child(c.title()))
             .children(
                 unread
@@ -1064,7 +1322,7 @@ impl DiscordApp {
             .h(px(52.))
             .flex_shrink_0()
             .px_2()
-            .bg(rgb(color::PANEL))
+            .bg(rgb(color::panel()))
             .flex()
             .items_center()
             .gap_2()
@@ -1077,12 +1335,12 @@ impl DiscordApp {
                         .size(px(12.))
                         .rounded_full()
                         .bg(rgb(if self.connected {
-                            color::GREEN
+                            color::green()
                         } else {
-                            color::MUTED
+                            color::muted()
                         }))
                         .border_2()
-                        .border_color(rgb(color::PANEL)),
+                        .border_color(rgb(color::panel())),
                 ),
             )
             .child(
@@ -1095,10 +1353,10 @@ impl DiscordApp {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(color::BRIGHT))
+                            .text_color(rgb(color::bright()))
                             .child(me.display_name().to_string()),
                     )
-                    .child(div().text_xs().text_color(rgb(color::MUTED)).child(
+                    .child(div().text_xs().text_color(rgb(color::muted())).child(
                         if self.connected {
                             "En ligne"
                         } else {
@@ -1113,9 +1371,9 @@ impl DiscordApp {
                     .py_1()
                     .rounded(px(4.))
                     .text_xs()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+                    .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
                     .child("Réglages")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings = true;
@@ -1129,6 +1387,8 @@ impl DiscordApp {
     fn chat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (prefix, title) = match &self.channel {
             Some(c) if c.is_dm() => ("@", c.title()),
+            Some(c) if c.is_thread() => ("⤷", c.title()),
+            Some(c) if c.is_forum() => ("▤", c.title()),
             Some(c) => ("#", c.title()),
             None if self.guild.is_none() => ("", "Amis".to_string()),
             None => ("", String::new()),
@@ -1147,27 +1407,27 @@ impl DiscordApp {
             .items_center()
             .gap_2()
             .border_b_1()
-            .border_color(rgb(color::RAIL))
+            .border_color(rgb(color::rail()))
             .child(
                 div()
                     .text_size(px(22.))
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child(prefix),
             )
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::BRIGHT))
+                    .text_color(rgb(color::bright()))
                     .child(title.clone()),
             )
             .when(!topic.is_empty(), |d| {
-                d.child(div().w(px(1.)).h(px(24.)).mx_1().bg(rgb(color::DIVIDER)))
+                d.child(div().w(px(1.)).h(px(24.)).mx_1().bg(rgb(color::divider())))
                     .child(
                         div()
                             .flex_1()
                             .overflow_hidden()
                             .text_sm()
-                            .text_color(rgb(color::MUTED))
+                            .text_color(rgb(color::muted()))
                             .child(topic),
                     )
             })
@@ -1202,7 +1462,9 @@ impl DiscordApp {
                 ))
             });
 
-        let body: AnyElement = if self.channel.is_some() {
+        let body: AnyElement = if self.channel.as_ref().is_some_and(|c| c.is_forum()) {
+            self.forum_view(cx)
+        } else if self.channel.is_some() {
             let older = (!self.history_done && self.messages.len() >= 50).then(|| {
                 div()
                     .id("older")
@@ -1213,9 +1475,9 @@ impl DiscordApp {
                     .justify_center()
                     .rounded(px(4.))
                     .text_sm()
-                    .text_color(rgb(color::LINK))
+                    .text_color(rgb(color::link()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(color::HOVER)))
+                    .hover(|d| d.bg(rgb(color::hover())))
                     .child(if self.loading_older {
                         "Chargement…"
                     } else {
@@ -1245,12 +1507,14 @@ impl DiscordApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .child("Choisissez un salon.")
                 .into_any_element()
         };
 
-        let placeholder = if prefix == "@" {
+        let placeholder = if self.channel.as_ref().is_some_and(|c| c.is_forum()) {
+            "Titre de la publication (Maj+Entrée pour le message)".to_string()
+        } else if prefix == "@" {
             format!("Envoyer un message à @{title}")
         } else {
             format!("Envoyer un message dans #{title}")
@@ -1265,6 +1529,7 @@ impl DiscordApp {
             None
         };
         let has_banner = banner.is_some();
+        let slash = self.slash_popup(cx);
 
         let composer = self.channel.is_some().then(|| {
             div()
@@ -1272,6 +1537,7 @@ impl DiscordApp {
                 .flex_shrink_0()
                 .flex()
                 .flex_col()
+                .children(slash)
                 .children(banner)
                 .child(
                     div()
@@ -1280,7 +1546,7 @@ impl DiscordApp {
                         .px_4()
                         .when(has_banner, |d| d.rounded_b(px(8.)))
                         .when(!has_banner, |d| d.rounded(px(8.)))
-                        .bg(rgb(color::INPUT))
+                        .bg(rgb(color::input()))
                         .flex()
                         .items_start()
                         .gap_3()
@@ -1290,10 +1556,10 @@ impl DiscordApp {
                                 .size(px(24.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(color::MUTED))
-                                .hover(|d| d.bg(rgb(color::BRIGHT)))
+                                .bg(rgb(color::muted()))
+                                .hover(|d| d.bg(rgb(color::bright())))
                                 .cursor_pointer()
-                                .text_color(rgb(color::INPUT))
+                                .text_color(rgb(color::input()))
                                 .font_weight(FontWeight::BOLD)
                                 .flex()
                                 .items_center()
@@ -1316,6 +1582,8 @@ impl DiscordApp {
                                 .hover(|d| d.opacity(1.))
                                 .child("🙂")
                                 .on_click(cx.listener(|this, _, _, cx| {
+                                    this.picker_tab = PickerTab::Emoji;
+                                    this.gif_typing = false;
                                     this.picker = match this.picker {
                                         Some(_) => None,
                                         None => Some(Picker::Composer),
@@ -1328,7 +1596,7 @@ impl DiscordApp {
                     div()
                         .h(px(24.))
                         .text_xs()
-                        .text_color(rgb(color::BRIGHT))
+                        .text_color(rgb(color::bright()))
                         .child(self.typing_text().unwrap_or_default()),
                 )
         });
@@ -1347,7 +1615,7 @@ impl DiscordApp {
                         .px_4()
                         .pb_1()
                         .text_sm()
-                        .text_color(rgb(color::RED))
+                        .text_color(rgb(color::red()))
                         .child(self.status.clone()),
                 )
             })
@@ -1360,7 +1628,7 @@ impl DiscordApp {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(rgb(color::CHAT))
+            .bg(rgb(color::chat()))
             .flex()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.upload(paths.paths().to_vec(), cx)
@@ -1372,7 +1640,129 @@ impl DiscordApp {
             .children(picker)
     }
 
+    fn picker_tabs(&self, cx: &mut Context<Self>) -> Div {
+        let composer = matches!(self.picker, Some(Picker::Composer));
+        let tab = |id: &'static str, label: &'static str, active: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded(px(4.))
+                .text_sm()
+                .cursor_pointer()
+                .text_color(rgb(if active {
+                    color::bright()
+                } else {
+                    color::muted()
+                }))
+                .when(active, |d| d.bg(rgb(color::active())))
+                .hover(|d| d.bg(rgb(color::hover())))
+                .child(label)
+        };
+        div()
+            .p_2()
+            .flex()
+            .gap_1()
+            .child(
+                tab("tab-emoji", "Émojis", self.picker_tab == PickerTab::Emoji).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.picker_tab = PickerTab::Emoji;
+                        this.gif_typing = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .when(composer, |d| {
+                d.child(
+                    tab("tab-gif", "GIF", self.picker_tab == PickerTab::Gif)
+                        .on_click(cx.listener(|this, _, _, cx| this.open_gif_tab(cx))),
+                )
+            })
+    }
+
+    fn gif_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let search = div()
+            .mx_2()
+            .h(px(32.))
+            .px_3()
+            .rounded(px(4.))
+            .bg(rgb(color::rail()))
+            .flex()
+            .items_center()
+            .child(if self.gif_query.is_empty() {
+                div().flex().items_center().child(Self::caret()).child(
+                    div()
+                        .text_color(rgb(color::muted()))
+                        .child("Rechercher des GIF (Entrée)"),
+                )
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .child(self.gif_query.clone())
+                    .child(Self::caret())
+            });
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(search)
+            .child(
+                div()
+                    .id("gif-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_2()
+                    .flex()
+                    .flex_col()
+                    .when(!self.gif_note.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(color::muted()))
+                                .child(self.gif_note.clone()),
+                        )
+                    })
+                    .child(div().flex().flex_wrap().gap_1().children(
+                        self.gifs.iter().enumerate().map(|(i, g)| {
+                            let url = g.url.clone();
+                            let tile = div()
+                                .id(SharedString::from(format!("gif-{i}")))
+                                .w(px(108.))
+                                .h(px(84.))
+                                .rounded(px(4.))
+                                .overflow_hidden()
+                                .bg(rgb(color::rail()))
+                                .cursor_pointer()
+                                .hover(|d| d.opacity(0.8));
+                            match self.images.get(&g.preview) {
+                                Some(im) => tile.child(
+                                    img(im.clone())
+                                        .w(px(108.))
+                                        .h(px(84.))
+                                        .object_fit(ObjectFit::Cover),
+                                ),
+                                None => tile.flex().items_center().justify_center().child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(color::muted()))
+                                        .child(g.title.chars().take(14).collect::<String>()),
+                                ),
+                            }
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.send_gif(url.clone(), cx)),
+                            )
+                        }),
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn emoji_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let composer = matches!(self.picker, Some(Picker::Composer));
         let mut body = div()
             .id("emoji-scroll")
             .flex_1()
@@ -1388,7 +1778,7 @@ impl DiscordApp {
                         div()
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(color::MUTED))
+                            .text_color(rgb(color::muted()))
                             .child("CE SERVEUR"),
                     )
                     .child(div().flex().flex_wrap().children(custom.iter().map(|e| {
@@ -1405,7 +1795,7 @@ impl DiscordApp {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(color::HOVER)))
+                            .hover(|d| d.bg(rgb(color::hover())))
                             .child(pic)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.pick_custom(&emoji, cx)),
@@ -1419,7 +1809,7 @@ impl DiscordApp {
                     div()
                         .text_xs()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(color::MUTED))
+                        .text_color(rgb(color::muted()))
                         .child(name.to_uppercase()),
                 )
                 .child(div().flex().flex_wrap().children(list.iter().map(|e| {
@@ -1433,7 +1823,7 @@ impl DiscordApp {
                         .justify_center()
                         .text_size(px(22.))
                         .cursor_pointer()
-                        .hover(|d| d.bg(rgb(color::HOVER)))
+                        .hover(|d| d.bg(rgb(color::hover())))
                         .child(e.clone())
                         .on_click(cx.listener(move |this, _, _, cx| this.pick_emoji(&e, cx)))
                 })));
@@ -1457,14 +1847,19 @@ impl DiscordApp {
                     .w(px(360.))
                     .h(px(340.))
                     .rounded(px(8.))
-                    .bg(rgb(color::SIDEBAR))
+                    .bg(rgb(color::sidebar()))
                     .border_1()
-                    .border_color(rgb(color::RAIL))
+                    .border_color(rgb(color::rail()))
                     .shadow_lg()
                     .flex()
                     .flex_col()
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(body),
+                    .child(self.picker_tabs(cx))
+                    .child(if self.picker_tab == PickerTab::Gif && composer {
+                        self.gif_body(cx)
+                    } else {
+                        body.into_any_element()
+                    }),
             )
             .into_any_element()
     }
@@ -1476,10 +1871,20 @@ impl DiscordApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .child("Aucun ami à afficher pour le moment.")
                 .into_any_element();
         }
+        let mut sorted_friends = self.friends.clone();
+        sorted_friends.sort_by_key(|u| {
+            let rank = match self.presence.get(&u.id).map(|s| s.as_str()) {
+                Some("online") => 0,
+                Some("idle") => 1,
+                Some("dnd") => 2,
+                _ => 3,
+            };
+            (rank, u.display_name().to_lowercase())
+        });
         div()
             .id("friends")
             .flex_1()
@@ -1492,24 +1897,29 @@ impl DiscordApp {
                     .pb_2()
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child(format!("AMIS — {}", self.friends.len())),
             )
-            .children(self.friends.iter().map(|u| {
+            .children(sorted_friends.iter().map(|u| {
                 let user = u.clone();
+                let st = self
+                    .presence
+                    .get(&u.id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("offline");
                 div()
                     .id(SharedString::from(format!("f-{}", u.id)))
                     .h(px(60.))
                     .px_3()
                     .rounded(px(8.))
                     .border_t_1()
-                    .border_color(rgb(color::DIVIDER))
+                    .border_color(rgb(color::divider()))
                     .flex()
                     .items_center()
                     .gap_3()
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(color::HOVER)))
-                    .child(self.avatar(u, 36.))
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .child(self.avatar_status(u, 36., color::chat()))
                     .child(
                         div()
                             .flex()
@@ -1517,14 +1927,14 @@ impl DiscordApp {
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(color::BRIGHT))
+                                    .text_color(rgb(color::bright()))
                                     .child(u.display_name().to_string()),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(color::MUTED))
-                                    .child(u.username.clone()),
+                                    .text_color(rgb(color::muted()))
+                                    .child(format!("{} · {}", status_label(st), u.username)),
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.open_dm_with(&user, cx)))
@@ -1532,23 +1942,78 @@ impl DiscordApp {
             .into_any_element()
     }
 
+    fn slash_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sugg = self.slash_suggestions();
+        if sugg.is_empty() {
+            return None;
+        }
+        let sel = self.slash_sel.min(sugg.len() - 1);
+        Some(
+            div()
+                .mb_1()
+                .p_2()
+                .rounded(px(8.))
+                .bg(rgb(color::sidebar()))
+                .border_1()
+                .border_color(rgb(color::divider()))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .child(Self::section_label("COMMANDES".into()))
+                .children(sugg.into_iter().enumerate().map(|(i, e)| {
+                    let name = e.name.clone();
+                    div()
+                        .id(SharedString::from(format!("slash-{i}")))
+                        .h(px(36.))
+                        .px_2()
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .cursor_pointer()
+                        .when(i == sel, |d| d.bg(rgb(color::active())))
+                        .hover(|d| d.bg(rgb(color::hover())))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(color::bright()))
+                                .child(format!("/{}", e.name)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_sm()
+                                .text_color(rgb(color::muted()))
+                                .child(e.desc),
+                        )
+                        .child(div().text_xs().text_color(rgb(color::muted())).child(e.app))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_input(format!("/{name} "));
+                            cx.notify();
+                        }))
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn banner(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
         div()
             .px_4()
             .py(px(6.))
             .rounded_t(px(8.))
-            .bg(rgb(color::SIDEBAR))
+            .bg(rgb(color::sidebar()))
             .flex()
             .items_center()
             .text_sm()
-            .text_color(rgb(color::MUTED))
+            .text_color(rgb(color::muted()))
             .child(div().flex_1().overflow_hidden().child(text))
             .child(
                 div()
                     .id("cancel-compose")
                     .px_2()
                     .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(color::BRIGHT)))
+                    .hover(|d| d.text_color(rgb(color::bright())))
                     .child("✕")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.cancel_compose();
@@ -1579,7 +2044,7 @@ impl DiscordApp {
             .w(px(260.))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(color::SIDEBAR))
+            .bg(rgb(color::sidebar()))
             .overflow_y_scroll()
             .p_2()
             .flex()
@@ -1594,18 +2059,15 @@ impl DiscordApp {
             .pb_1()
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(color::MUTED))
+            .text_color(rgb(color::muted()))
             .child(text)
     }
 
     fn person_row(&self, u: &User, status: Option<&str>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let status = status.or_else(|| self.presence.get(&u.id).map(|s| s.as_str()));
         let offline = matches!(status, Some("offline") | Some("invisible"));
-        let dot = status.and_then(|s| match s {
-            "online" => Some(color::GREEN),
-            "idle" => Some(0xf0b232),
-            "dnd" => Some(color::RED),
-            _ => None,
-        });
+        let dot = status.and_then(status_color);
+        let tint = self.name_color(&u.id);
         let user = u.clone();
         div()
             .id(SharedString::from(format!("p-{}", u.id)))
@@ -1617,7 +2079,7 @@ impl DiscordApp {
             .rounded(px(4.))
             .cursor_pointer()
             .when(offline, |d| d.opacity(0.5))
-            .hover(|d| d.bg(rgb(color::HOVER)))
+            .hover(|d| d.bg(rgb(color::hover())))
             .child(
                 div()
                     .relative()
@@ -1631,14 +2093,14 @@ impl DiscordApp {
                             .rounded_full()
                             .bg(rgb(c))
                             .border_2()
-                            .border_color(rgb(color::SIDEBAR))
+                            .border_color(rgb(color::sidebar()))
                     })),
             )
             .child(
                 div()
                     .flex_1()
                     .overflow_hidden()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(tint.unwrap_or_else(color::muted)))
                     .child(u.display_name().to_string()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1660,12 +2122,12 @@ impl DiscordApp {
                             other => self
                                 .roles
                                 .get(other)
-                                .map(|r| r.to_uppercase())
+                                .map(|r| r.name.to_uppercase())
                                 .unwrap_or_else(|| "RÔLE".into()),
                         };
                         panel = panel.child(Self::section_label(format!("{name} — {count}")));
                     }
-                    MemberRow::Member { user, status } => {
+                    MemberRow::Member { user, status, .. } => {
                         panel = panel.child(self.person_row(user, Some(status), cx));
                     }
                 }
@@ -1704,9 +2166,13 @@ impl DiscordApp {
             .px_3()
             .mb_2()
             .rounded(px(4.))
-            .bg(rgb(color::RAIL))
+            .bg(rgb(color::rail()))
             .border_1()
-            .border_color(rgb(if focused { color::BRAND } else { color::RAIL }))
+            .border_color(rgb(if focused {
+                color::brand()
+            } else {
+                color::rail()
+            }))
             .flex()
             .items_center()
             .cursor_text()
@@ -1719,7 +2185,7 @@ impl DiscordApp {
                     .child(Self::caret())
             } else {
                 div()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child("Rechercher (Entrée pour lancer)")
             })
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1737,7 +2203,7 @@ impl DiscordApp {
                 div()
                     .px_2()
                     .text_sm()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child(self.search_note.clone()),
             );
         }
@@ -1762,7 +2228,7 @@ impl DiscordApp {
                 div()
                     .px_2()
                     .text_sm()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child(empty.to_string()),
             );
         }
@@ -1782,7 +2248,7 @@ impl DiscordApp {
             .mb_1()
             .p_2()
             .rounded(px(4.))
-            .bg(rgb(color::CHAT))
+            .bg(rgb(color::chat()))
             .flex()
             .gap_2()
             .child(self.avatar(&m.author, 28.))
@@ -1801,13 +2267,13 @@ impl DiscordApp {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(color::BRIGHT))
+                                    .text_color(rgb(color::bright()))
                                     .child(m.author.display_name().to_string()),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(rgb(color::MUTED))
+                                    .text_color(rgb(color::muted()))
                                     .child(when),
                             ),
                     )
@@ -1834,8 +2300,12 @@ impl DiscordApp {
             .rounded(px(4.))
             .text_sm()
             .cursor_pointer()
-            .text_color(rgb(if active { color::BRIGHT } else { color::MUTED }))
-            .hover(|d| d.bg(rgb(color::HOVER)).text_color(rgb(color::BRIGHT)))
+            .text_color(rgb(if active {
+                color::bright()
+            } else {
+                color::muted()
+            }))
+            .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| on(this, cx)))
     }
@@ -1855,7 +2325,11 @@ impl DiscordApp {
                 .cursor_pointer()
                 .text_sm()
                 .text_color(rgb(0xffffff))
-                .bg(rgb(if primary { color::BRAND } else { color::ACTIVE }))
+                .bg(rgb(if primary {
+                    color::brand()
+                } else {
+                    color::active()
+                }))
                 .child(label)
         };
         div()
@@ -1877,11 +2351,11 @@ impl DiscordApp {
                     .id("profile")
                     .w(px(360.))
                     .rounded(px(8.))
-                    .bg(rgb(color::SIDEBAR))
+                    .bg(rgb(color::sidebar()))
                     .shadow_lg()
                     .overflow_hidden()
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(div().h(px(80.)).bg(rgb(color::BRAND)))
+                    .child(div().h(px(80.)).bg(rgb(color::brand())))
                     .child(
                         div()
                             .px_4()
@@ -1895,7 +2369,7 @@ impl DiscordApp {
                                     .size(px(88.))
                                     .rounded_full()
                                     .border_4()
-                                    .border_color(rgb(color::SIDEBAR))
+                                    .border_color(rgb(color::sidebar()))
                                     .child(self.avatar(&u, 80.)),
                             )
                             .child(
@@ -1906,19 +2380,19 @@ impl DiscordApp {
                                         div()
                                             .text_size(px(20.))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(color::BRIGHT))
+                                            .text_color(rgb(color::bright()))
                                             .child(u.display_name().to_string()),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(color::MUTED))
+                                            .text_color(rgb(color::muted()))
                                             .child(u.username.clone()),
                                     ),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(color::MUTED))
+                                    .text_color(rgb(color::muted()))
                                     .child(format!("ID : {}", u.id)),
                             )
                             .child(
@@ -1967,7 +2441,7 @@ impl DiscordApp {
                         .w(px(40.))
                         .h(px(22.))
                         .rounded_full()
-                        .bg(rgb(if on { color::GREEN } else { color::MUTED }))
+                        .bg(rgb(if on { color::green() } else { color::muted() }))
                         .flex()
                         .items_center()
                         .when(on, |d| d.justify_end())
@@ -1994,7 +2468,7 @@ impl DiscordApp {
                     .id("settings")
                     .w(px(480.))
                     .rounded(px(8.))
-                    .bg(rgb(color::CHAT))
+                    .bg(rgb(color::chat()))
                     .shadow_lg()
                     .p_5()
                     .flex()
@@ -2005,7 +2479,7 @@ impl DiscordApp {
                         div()
                             .text_size(px(20.))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(color::BRIGHT))
+                            .text_color(rgb(color::bright()))
                             .child("Paramètres utilisateur"),
                     )
                     .child(Self::section_label("MON COMPTE".into()))
@@ -2013,7 +2487,7 @@ impl DiscordApp {
                         div()
                             .p_3()
                             .rounded(px(8.))
-                            .bg(rgb(color::SIDEBAR))
+                            .bg(rgb(color::sidebar()))
                             .flex()
                             .items_center()
                             .gap_3()
@@ -2025,22 +2499,35 @@ impl DiscordApp {
                                     .child(
                                         div()
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(color::BRIGHT))
+                                            .text_color(rgb(color::bright()))
                                             .child(me.display_name().to_string()),
                                     )
                                     .child(
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(color::MUTED))
+                                            .text_color(rgb(color::muted()))
                                             .child(me.username.clone()),
                                     ),
                             ),
                     )
                     .child(Self::section_label("APPLICATION".into()))
                     .child(
+                        toggle("set-theme", "Thème clair", self.light)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                    )
+                    .child(
+                        toggle("set-notif", "Notifications du bureau", self.notifications)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.notifications = !this.notifications;
+                                this.save_prefs();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         toggle("set-side", "Afficher le panneau latéral", self.show_side).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.show_side = !this.show_side;
+                                this.save_prefs();
                                 cx.notify();
                             }),
                         ),
@@ -2053,6 +2540,7 @@ impl DiscordApp {
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.title_badge = !this.title_badge;
+                            this.save_prefs();
                             cx.notify();
                         })),
                     )
@@ -2070,7 +2558,7 @@ impl DiscordApp {
                                     .flex()
                                     .items_center()
                                     .cursor_pointer()
-                                    .bg(rgb(color::RED))
+                                    .bg(rgb(color::red()))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .child("Se déconnecter")
@@ -2085,7 +2573,7 @@ impl DiscordApp {
                                     .flex()
                                     .items_center()
                                     .cursor_pointer()
-                                    .bg(rgb(color::ACTIVE))
+                                    .bg(rgb(color::active()))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .child("Fermer")
@@ -2115,15 +2603,19 @@ impl DiscordApp {
                 div()
                     .text_size(px(28.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(color::BRIGHT))
+                    .text_color(rgb(color::bright()))
                     .child(if prefix == "@" {
+                        title.to_string()
+                    } else if prefix == "⤷" {
                         title.to_string()
                     } else {
                         format!("Bienvenue sur #{title} !")
                     }),
             )
-            .child(div().text_color(rgb(color::MUTED)).child(if prefix == "@" {
+            .child(div().text_color(rgb(color::muted())).child(if prefix == "@" {
                 format!("Ceci est le début de votre historique de messages privés avec @{title}.")
+            } else if prefix == "⤷" {
+                "Ceci est le début du fil de discussion.".to_string()
             } else {
                 format!("Ceci est le début du salon #{title}.")
             }))
@@ -2161,7 +2653,7 @@ impl DiscordApp {
     }
 
     fn day_divider(t: &DateTime<Local>) -> AnyElement {
-        let line = || div().flex_1().h(px(1.)).bg(rgb(color::DIVIDER));
+        let line = || div().flex_1().h(px(1.)).bg(rgb(color::divider()));
         div()
             .mx_4()
             .my_2()
@@ -2170,7 +2662,7 @@ impl DiscordApp {
             .gap_2()
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(color::MUTED))
+            .text_color(rgb(color::muted()))
             .child(line())
             .child(format!(
                 "{} {} {}",
@@ -2209,7 +2701,7 @@ impl DiscordApp {
             hl.push((
                 start..text.len(),
                 HighlightStyle {
-                    color: Some(rgb(color::MUTED).into()),
+                    color: Some(rgb(color::muted()).into()),
                     ..Default::default()
                 },
             ));
@@ -2244,12 +2736,12 @@ impl DiscordApp {
                     .w(px(w))
                     .h(px(h))
                     .rounded(px(8.))
-                    .bg(rgb(color::SIDEBAR))
+                    .bg(rgb(color::sidebar()))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_sm()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .child("Chargement de l'image…")
                     .into_any_element(),
             };
@@ -2258,8 +2750,8 @@ impl DiscordApp {
             .px_3()
             .py_2()
             .rounded(px(4.))
-            .bg(rgb(color::SIDEBAR))
-            .text_color(rgb(color::LINK))
+            .bg(rgb(color::sidebar()))
+            .text_color(rgb(color::link()))
             .child(a.filename.clone())
             .into_any_element()
     }
@@ -2279,9 +2771,9 @@ impl DiscordApp {
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(if e.url.is_some() {
-                        color::LINK
+                        color::link()
                     } else {
-                        color::BRIGHT
+                        color::bright()
                     }))
                     .child(t.clone()),
             );
@@ -2303,7 +2795,7 @@ impl DiscordApp {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(color::BRIGHT))
+                            .text_color(rgb(color::bright()))
                             .child(f.name.clone()),
                     )
                     .child(div().text_sm().child(f.value.clone())),
@@ -2341,9 +2833,9 @@ impl DiscordApp {
             .max_w(px(520.))
             .p_3()
             .rounded_r(px(4.))
-            .bg(rgb(color::SIDEBAR))
+            .bg(rgb(color::sidebar()))
             .border_l_4()
-            .border_color(rgb(e.color.unwrap_or(color::DIVIDER)))
+            .border_color(rgb(e.color.unwrap_or(color::divider())))
             .child(row)
             .into_any_element()
     }
@@ -2379,9 +2871,13 @@ impl DiscordApp {
                     .gap_1()
                     .cursor_pointer()
                     .border_1()
-                    .border_color(rgb(if me { color::BRAND } else { color::SIDEBAR }))
-                    .bg(rgb(if me { 0x3b405a } else { color::SIDEBAR }))
-                    .hover(|d| d.border_color(rgb(color::DIVIDER)))
+                    .border_color(rgb(if me { color::brand() } else { color::sidebar() }))
+                    .bg(rgb(if me {
+                        color::react_me()
+                    } else {
+                        color::sidebar()
+                    }))
+                    .hover(|d| d.border_color(rgb(color::divider())))
                     .child(glyph)
                     .child(div().text_sm().child(r.count.to_string()))
                     .on_click(
@@ -2404,11 +2900,17 @@ impl DiscordApp {
                 .py_1()
                 .text_xs()
                 .cursor_pointer()
-                .text_color(rgb(if danger { color::RED } else { color::MUTED }))
-                .hover(|d| d.bg(rgb(color::HOVER)))
+                .text_color(rgb(if danger { color::red() } else { color::muted() }))
+                .hover(|d| d.bg(rgb(color::hover())))
                 .child(label.to_string())
         };
-        let (reply, edit, del, react) = (m.clone(), m.clone(), m.clone(), m.clone());
+        let (reply, edit, del, react, thread) =
+            (m.clone(), m.clone(), m.clone(), m.clone(), m.clone());
+        let can_thread = m.thread.is_none()
+            && self
+                .channel
+                .as_ref()
+                .is_some_and(|c| !c.is_dm() && !c.is_thread());
         let copy = m.content.clone();
         div()
             .absolute()
@@ -2417,8 +2919,8 @@ impl DiscordApp {
             .flex()
             .rounded(px(4.))
             .border_1()
-            .border_color(rgb(color::RAIL))
-            .bg(rgb(color::CHAT))
+            .border_color(rgb(color::rail()))
+            .bg(rgb(color::chat()))
             .opacity(0.)
             .group_hover(group, |s| s.opacity(1.))
             .child(
@@ -2433,6 +2935,13 @@ impl DiscordApp {
                 btn(format!("reply-{}", m.id), "Répondre", false)
                     .on_click(cx.listener(move |this, _, _, cx| this.start_reply(&reply, cx))),
             )
+            .when(can_thread, |d| {
+                d.child(
+                    btn(format!("thread-{}", m.id), "Fil", false).on_click(
+                        cx.listener(move |this, _, _, cx| this.start_thread(&thread, cx)),
+                    ),
+                )
+            })
             .child(
                 btn(format!("copy-{}", m.id), "Copier", false).on_click(cx.listener(
                     move |_, _, _, cx| {
@@ -2472,14 +2981,16 @@ impl DiscordApp {
             let mut head = div().flex().items_baseline().gap_2().child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(color::BRIGHT))
+                    .text_color(rgb(self
+                        .name_color(&m.author.id)
+                        .unwrap_or_else(color::bright)))
                     .child(name.clone()),
             );
             if let Some(t) = time {
                 head = head.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(color::MUTED))
+                        .text_color(rgb(color::muted()))
                         .child(stamp(t)),
                 );
             }
@@ -2497,6 +3008,47 @@ impl DiscordApp {
         if !m.reactions.is_empty() {
             text = text.child(self.reactions(m, cx));
         }
+        if let Some(t) = &m.thread {
+            let chan = (**t).clone();
+            let count = t.message_count.unwrap_or(0);
+            text = text.child(
+                div()
+                    .id(SharedString::from(format!("chip-{}", m.id)))
+                    .mt_1()
+                    .max_w(px(420.))
+                    .px_3()
+                    .py_1()
+                    .rounded(px(6.))
+                    .bg(rgb(color::sidebar()))
+                    .border_1()
+                    .border_color(rgb(color::divider()))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child("⤷")
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(color::link()))
+                            .child(t.title()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color::muted()))
+                            .child(format!(
+                                "{count} message{}",
+                                if count > 1 { "s" } else { "" }
+                            )),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
+                    ),
+            );
+        }
 
         let author = m.author.clone();
         let gutter = if grouped {
@@ -2506,7 +3058,7 @@ impl DiscordApp {
                 .flex()
                 .justify_center()
                 .text_size(px(10.))
-                .text_color(rgb(color::MUTED))
+                .text_color(rgb(color::muted()))
                 .opacity(0.)
                 .group_hover(group.clone(), |s| s.opacity(1.))
                 .child(time.map(hhmm).unwrap_or_default())
@@ -2533,12 +3085,14 @@ impl DiscordApp {
             .group(group.clone())
             .relative()
             .when(pinged, |d| {
-                d.bg(rgb(0x444037)).border_l_2().border_color(rgb(0xf0b232))
+                d.bg(rgb(color::ping_bg()))
+                    .border_l_2()
+                    .border_color(rgb(0xf0b232))
             })
             .px_4()
             .py(px(2.))
             .when(!grouped, |d| d.mt(px(14.)))
-            .hover(|d| d.bg(rgb(0x2e3035)))
+            .hover(|d| d.bg(rgb(color::msg_hover())))
             .flex()
             .flex_col();
 
@@ -2551,7 +3105,7 @@ impl DiscordApp {
                     .items_center()
                     .gap_2()
                     .text_sm()
-                    .text_color(rgb(color::MUTED))
+                    .text_color(rgb(color::muted()))
                     .overflow_hidden()
                     .child("↱")
                     .child(self.avatar(&r.author, 16.))
