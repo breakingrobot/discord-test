@@ -1,5 +1,6 @@
 mod api;
 mod assets;
+mod demo;
 mod emoji;
 mod gateway;
 mod notify;
@@ -358,6 +359,10 @@ impl DiscordApp {
             switcher: None,
             switcher_sel: 0,
         };
+        if std::env::var_os("DISCORD_DEMO").is_some() {
+            this.load_demo();
+            return this;
+        }
         let env = std::env::var("DISCORD_TOKEN")
             .ok()
             .filter(|t| !t.trim().is_empty());
@@ -541,6 +546,80 @@ impl DiscordApp {
         self.density = density.to_string();
         self.save_prefs();
         cx.notify();
+    }
+
+    /// Offline fixtures for `DISCORD_DEMO=1`.
+    fn load_demo(&mut self) {
+        let d = demo::data();
+        self.me = Some(d.me);
+        self.guilds = d.guilds;
+        self.dms = d.dms;
+        self.friends = d.friends;
+        self.logged_in = true;
+        self.connected = true;
+        self.guild = self.guilds.first().map(|g| g.id.clone());
+        self.channels = d.channels;
+        self.channel = self.channels.iter().find(|c| c.kind == 0).cloned();
+        self.learn_users(&d.messages);
+        self.messages = d.messages;
+        self.history_done = true;
+        for (id, st) in [
+            ("100000000000000002", "online"),
+            ("100000000000000003", "idle"),
+            ("100000000000000004", "dnd"),
+        ] {
+            self.presence.insert(id.into(), st.into());
+        }
+        self.unread.insert(
+            "300000000000000004".into(),
+            Unread {
+                guild: self.guild.clone(),
+                mentions: 2,
+                first_id: None,
+            },
+        );
+        self.unread.insert(
+            "300000000000000099".into(),
+            Unread {
+                guild: Some("200000000000000003".into()),
+                mentions: 0,
+                first_id: None,
+            },
+        );
+        // DISCORD_DEMO_VIEW=settings:1,theme:light,profile,friends,inbox,status,picker,switcher
+        let view = std::env::var("DISCORD_DEMO_VIEW").unwrap_or_default();
+        for part in view.split(',') {
+            let (k, v) = part.split_once(':').unwrap_or((part, ""));
+            match k {
+                "settings" => {
+                    self.settings = true;
+                    self.settings_tab = v.parse().unwrap_or(0);
+                }
+                "theme" => {
+                    self.theme = ui::color::Theme::from_key(v);
+                    ui::color::set_theme(self.theme);
+                }
+                "profile" => self.profile = self.users.get("100000000000000002").cloned(),
+                "friends" => {
+                    self.guild = None;
+                    self.channel = None;
+                }
+                "dm" => {
+                    self.guild = None;
+                    self.channel = self.dms.first().cloned();
+                }
+                "inbox" => {
+                    self.inbox_open = true;
+                    self.inbox = self.messages.iter().rev().take(2).cloned().collect();
+                }
+                "status" => self.status_menu = true,
+                "picker" => self.picker = Some(Picker::Composer),
+                "switcher" => self.switcher = Some("g".into()),
+                "reply" => self.replying = self.messages.get(1).cloned(),
+                "density" => self.density = v.to_string(),
+                _ => {}
+            }
+        }
     }
 
     fn sync_field(&mut self) {
@@ -2418,6 +2497,9 @@ impl Render for DiscordApp {
 }
 
 fn main() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        env_logger::init();
+    }
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
@@ -2427,6 +2509,11 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(360.), px(480.))),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Discord".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(gpui::point(px(12.), px(11.))),
+                    }),
                     ..Default::default()
                 },
                 |_, cx| cx.new(DiscordApp::new),

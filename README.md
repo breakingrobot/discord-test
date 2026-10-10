@@ -49,6 +49,9 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 - Using a user account with a third-party client is against Discord's Terms of Service (account risk is yours).
   QR and password login follow community-documented protocols and have not been verified against Discord here.
 
+Preview without an account: `DISCORD_DEMO=1 cargo run` (offline fixtures). `DISCORD_DEMO_VIEW` opens a
+screen directly, e.g. `settings:1`, `profile`, `friends,status`, `theme:light,inbox,reply`.
+
 ```
 DISCORD_TOKEN=... cargo run --release
 ```
