@@ -1,0 +1,3 @@
+[env]
+# Opus (audiopus_sys) ships an old CMakeLists that CMake 4 refuses without this.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
 jobs:
   build:
     runs-on: windows-latest
