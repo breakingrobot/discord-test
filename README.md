@@ -33,6 +33,13 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 - Messages: highlighted user / role / channel mentions and @everyone / @here (clickable), `<t:…>` timestamps,
   reply headers with connector line (deleted originals handled), system messages (join, pin, boost, thread created),
   stickers. Roles are read from READY (REST fallback).
+- 2025-style design: Light / Ash / Dark / Onyx themes, top title bar, squircle server rail, rounded channel
+  list, floating user panel, resizable sidebar, Lucide icons (ISC) and the Inter font (OFL) embedded, tooltips,
+  fade-in popovers, density setting (compact / default / spacious), redesigned settings, friends tabs.
+- Mentions inbox, status picker (online / idle / dnd / invisible), "NOUVEAUX" unread divider, click a reply to
+  jump to the original message.
+- Low memory: decoded-image cache capped and evicted (GPU copies released too), per-guild caches dropped on
+  switch, bounded history, small CDN sizes, release profile with LTO + strip.
 - Responsive layout (side panel becomes an overlay under 1050 px; under 760 px the sidebar slides over the chat via ☰),
   skeleton placeholders while avatars / images / messages / channels load, a "jump to latest" button, and clear
   messages for missing permissions (HTTP 403: locked channel view, disabled composer).

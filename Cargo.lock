@@ -1394,6 +1394,7 @@ dependencies = [
 name = "discord-test"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "chrono",
  "flume",
@@ -1402,6 +1403,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.8",
  "rsa",
+ "rust-embed",
  "rustls",
  "serde",
  "serde_json",

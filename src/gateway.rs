@@ -27,6 +27,8 @@ pub enum Command {
         guild_id: String,
         channel_id: String,
     },
+    /// "online" | "idle" | "dnd" | "invisible".
+    SetStatus(String),
 }
 
 #[derive(Debug, Clone)]
@@ -214,10 +216,20 @@ fn run(
             next_beat = Instant::now() + interval;
         }
         while let Ok(cmd) = cmds.try_recv() {
-            let Command::RequestMembers {
-                guild_id,
-                channel_id,
-            } = cmd;
+            let (guild_id, channel_id) = match cmd {
+                Command::RequestMembers {
+                    guild_id,
+                    channel_id,
+                } => (guild_id, channel_id),
+                Command::SetStatus(status) => {
+                    let msg = json!({ "op": 3, "d": {
+                        "status": status, "since": 0, "activities": [], "afk": false,
+                    }});
+                    ws.send(Ws::text(msg.to_string()))
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            };
             if session.id.is_some() && !auth.starts_with("Bot ") {
                 let msg = json!({ "op": 14, "d": {
                     "guild_id": guild_id,

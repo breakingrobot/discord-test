@@ -5,10 +5,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, linear_color_stop, linear_gradient, prelude::*, pulsating_between, px, rgb, rgba,
-    Animation, AnimationExt, AnyElement, Context, Div, ExternalPaths, FontStyle, FontWeight,
-    HighlightStyle, Image, InteractiveText, KeyDownEvent, ObjectFit, SharedString, Stateful,
-    StrikethroughStyle, StyledImage, StyledText, UnderlineStyle,
+    div, ease_in_out, img, linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
+    rgb, rgba, svg, Animation, AnimationExt, AnyElement, AnyView, App, Context, Div, ExternalPaths,
+    FontStyle, FontWeight, HighlightStyle, Image, InteractiveText, KeyDownEvent, MouseButton,
+    MouseMoveEvent, ObjectFit, Render, SharedString, Stateful, StrikethroughStyle, StyledImage,
+    StyledText, Svg, UnderlineStyle, Window,
 };
 
 use crate::api;
@@ -16,106 +17,195 @@ use crate::api::{Channel, Message, User};
 use crate::gateway::MemberRow;
 use crate::{DiscordApp, Field, LoginMode, Picker, PickerTab, QrState, Side};
 
-/// Theme palette: dark by default, light when `set_light(true)`.
+/// Theme palette (Discord 2025 refresh: Light, Ash, Dark, Onyx).
 pub mod color {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    static LIGHT: AtomicBool = AtomicBool::new(false);
-
-    pub fn set_light(on: bool) {
-        LIGHT.store(on, Ordering::Relaxed);
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Theme {
+        Light = 0,
+        Ash = 1,
+        Dark = 2,
+        Onyx = 3,
     }
 
-    pub fn is_light() -> bool {
-        LIGHT.load(Ordering::Relaxed)
-    }
+    impl Theme {
+        pub const ALL: [Theme; 4] = [Theme::Light, Theme::Ash, Theme::Dark, Theme::Onyx];
 
-    fn pick(dark: u32, light: u32) -> u32 {
-        if is_light() {
-            light
-        } else {
-            dark
+        pub fn label(self) -> &'static str {
+            match self {
+                Theme::Light => "Clair",
+                Theme::Ash => "Cendre",
+                Theme::Dark => "Sombre",
+                Theme::Onyx => "Onyx",
+            }
+        }
+
+        pub fn key(self) -> &'static str {
+            match self {
+                Theme::Light => "light",
+                Theme::Ash => "ash",
+                Theme::Dark => "dark",
+                Theme::Onyx => "onyx",
+            }
+        }
+
+        pub fn from_key(k: &str) -> Theme {
+            Theme::ALL
+                .into_iter()
+                .find(|t| t.key() == k)
+                .unwrap_or(Theme::Dark)
         }
     }
 
+    static THEME: AtomicU8 = AtomicU8::new(Theme::Dark as u8);
+
+    pub fn set_theme(t: Theme) {
+        THEME.store(t as u8, Ordering::Relaxed);
+    }
+
+    pub fn theme() -> Theme {
+        Theme::ALL[THEME.load(Ordering::Relaxed) as usize % 4]
+    }
+
+    pub fn is_light() -> bool {
+        theme() == Theme::Light
+    }
+
+    /// Token table, indexed by [`Theme`].
+    const T: [[u32; 20]; 4] = [
+        // Light
+        [
+            0xe3e5e8, 0xf2f3f5, 0xffffff, 0xffffff, 0xebedef, 0xe8e9ec, 0xdcdee2, 0x2e3338,
+            0x060607, 0x5c5e66, 0x006ce7, 0xe1e2e4, 0xf7f7f8, 0xfff6dc, 0xe3e6fc, 0x3c45a5,
+            0xebedef, 0xe3e5e8, 0xdcdde0, 0x111214,
+        ],
+        // Ash
+        [
+            0x1e1f22, 0x2b2d31, 0x232428, 0x313338, 0x383a40, 0x35373c, 0x404249, 0xdbdee1,
+            0xf2f3f5, 0x949ba4, 0x00a8fc, 0x3f4147, 0x2e3035, 0x444037, 0x3b405a, 0xc9cdfb,
+            0x1e1f22, 0x1e1f22, 0x3a3c41, 0x111214,
+        ],
+        // Dark
+        [
+            0x121214, 0x121214, 0x1e1e22, 0x1a1a1e, 0x222327, 0x1f1f23, 0x29292e, 0xdfe0e2,
+            0xfbfbfb, 0x8d8e96, 0x4ea8ff, 0x26262b, 0x1e1e22, 0x2e2a1e, 0x262a45, 0xc9cdfb,
+            0x121214, 0x121214, 0x26262b, 0x0b0b0c,
+        ],
+        // Onyx
+        [
+            0x000000, 0x000000, 0x0f0f11, 0x070708, 0x111113, 0x111113, 0x1c1c1f, 0xdcdde0,
+            0xffffff, 0x84858c, 0x4ea8ff, 0x1a1a1d, 0x0e0e10, 0x241f12, 0x1b1e36, 0xc9cdfb,
+            0x121214, 0x000000, 0x1c1c1f, 0x18181b,
+        ],
+    ];
+
+    fn tok(i: usize) -> u32 {
+        T[theme() as usize][i]
+    }
+
     pub fn rail() -> u32 {
-        pick(0x1e1f22, 0xe3e5e8)
+        tok(0)
     }
 
     pub fn sidebar() -> u32 {
-        pick(0x2b2d31, 0xf2f3f5)
+        tok(1)
     }
 
     pub fn panel() -> u32 {
-        pick(0x232428, 0xebedef)
+        tok(2)
     }
 
     pub fn chat() -> u32 {
-        pick(0x313338, 0xffffff)
+        tok(3)
     }
 
     pub fn input() -> u32 {
-        pick(0x383a40, 0xebedef)
+        tok(4)
     }
 
     pub fn hover() -> u32 {
-        pick(0x35373c, 0xdfe1e5)
+        tok(5)
     }
 
     pub fn active() -> u32 {
-        pick(0x404249, 0xd1d3d8)
-    }
-
-    pub fn brand() -> u32 {
-        pick(0x5865f2, 0x5865f2)
-    }
-
-    pub fn green() -> u32 {
-        pick(0x23a55a, 0x23a55a)
-    }
-
-    pub fn red() -> u32 {
-        pick(0xf23f42, 0xd83c3e)
+        tok(6)
     }
 
     pub fn text() -> u32 {
-        pick(0xdbdee1, 0x2e3338)
+        tok(7)
     }
 
     pub fn bright() -> u32 {
-        pick(0xf2f3f5, 0x060607)
+        tok(8)
     }
 
     pub fn muted() -> u32 {
-        pick(0x949ba4, 0x5c5e66)
+        tok(9)
     }
 
     pub fn link() -> u32 {
-        pick(0x00a8fc, 0x006ce7)
+        tok(10)
     }
 
     pub fn divider() -> u32 {
-        pick(0x3f4147, 0xd7d9dd)
+        tok(11)
     }
 
     pub fn msg_hover() -> u32 {
-        pick(0x2e3035, 0xf7f7f8)
+        tok(12)
     }
 
     pub fn ping_bg() -> u32 {
-        pick(0x444037, 0xfff6dc)
+        tok(13)
     }
 
     pub fn react_me() -> u32 {
-        pick(0x3b405a, 0xe3e6fc)
+        tok(14)
     }
 
     pub fn mention_fg() -> u32 {
-        pick(0xc9cdfb, 0x3c45a5)
+        tok(15)
     }
 
     pub fn code_bg() -> u32 {
-        pick(0x1e1f22, 0xe3e5e8)
+        tok(16)
+    }
+
+    pub fn frame() -> u32 {
+        tok(17)
+    }
+
+    pub fn border() -> u32 {
+        tok(18)
+    }
+
+    pub fn tooltip() -> u32 {
+        tok(19)
+    }
+
+    pub fn brand() -> u32 {
+        0x5865f2
+    }
+
+    pub fn brand_hover() -> u32 {
+        0x4752c4
+    }
+
+    pub fn green() -> u32 {
+        0x23a55a
+    }
+
+    pub fn yellow() -> u32 {
+        0xf0b232
+    }
+
+    pub fn red() -> u32 {
+        if is_light() {
+            0xda373c
+        } else {
+            0xf23f42
+        }
     }
 }
 
@@ -225,6 +315,88 @@ fn connection_label(kind: &str) -> String {
                 .unwrap_or_default()
         }
     }
+}
+
+// ---- design primitives ---------------------------------------------------------
+
+/// Lucide icon tinted with `color`.
+pub fn icon(name: &str, size: f32, color: u32) -> Svg {
+    svg()
+        .path(SharedString::from(format!("icons/{name}.svg")))
+        .size(px(size))
+        .flex_none()
+        .text_color(rgb(color))
+}
+
+/// Small tooltip bubble (used through `.tooltip(tip("…"))`).
+pub struct Tip(SharedString);
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .font_family(crate::assets::FONT_FAMILY)
+            .px_2()
+            .py(px(5.))
+            .rounded(px(6.))
+            .bg(rgb(color::tooltip()))
+            .shadow_md()
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(0xf2f3f5))
+            .child(self.0.clone())
+    }
+}
+
+pub fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| cx.new(|_| Tip(text.clone())).into()
+}
+
+/// Square icon button with hover state and tooltip.
+pub fn icon_button(
+    id: impl Into<SharedString>,
+    name: &str,
+    label: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let group: SharedString = format!("ib-{id}").into();
+    div()
+        .id(id)
+        .group(group.clone())
+        .size(px(32.))
+        .flex_none()
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(active, |d| d.bg(rgb(color::active())))
+        .hover(|d| d.bg(rgb(color::hover())))
+        .child(
+            icon(
+                name,
+                20.,
+                if active {
+                    color::bright()
+                } else {
+                    color::muted()
+                },
+            )
+            .group_hover(group, |s| s.text_color(rgb(color::bright()))),
+        )
+        .tooltip(tip(label))
+}
+
+/// Fade + slide-in used by popovers and dialogs.
+pub fn appear<E: IntoElement + Styled + 'static>(id: impl Into<SharedString>, el: E) -> AnyElement {
+    let id: SharedString = id.into();
+    el.with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(160)).with_easing(ease_in_out),
+        |el, d| el.opacity(d),
+    )
+    .into_any_element()
 }
 
 fn status_color(status: &str) -> Option<u32> {
@@ -640,7 +812,6 @@ fn acronym(name: &str) -> String {
         .collect()
 }
 
-/// Server-rail slot: the active/hover pill on the left plus the round button.
 fn mention_pill(count: u32) -> Div {
     div()
         .min_w(px(18.))
@@ -660,15 +831,15 @@ fn mention_pill(count: u32) -> Div {
 fn badge(count: u32) -> Div {
     div()
         .absolute()
-        .right(px(10.))
-        .bottom(px(-2.))
+        .right(px(12.))
+        .bottom(px(-4.))
         .min_w(px(18.))
         .h(px(18.))
         .px(px(5.))
         .rounded_full()
         .bg(rgb(color::red()))
         .border_2()
-        .border_color(rgb(color::rail()))
+        .border_color(rgb(color::frame()))
         .flex()
         .items_center()
         .justify_center()
@@ -680,20 +851,20 @@ fn badge(count: u32) -> Div {
 
 /// Server-rail slot: left pill (active / unread) plus the button and mention badge.
 fn rail_slot(button: Stateful<Div>, active: bool, unread: bool, mentions: u32) -> Div {
-    let tall = active;
     div()
         .relative()
         .w_full()
+        .flex_shrink_0()
         .flex()
         .justify_center()
         .child(
             div()
                 .absolute()
                 .left_0()
-                .top(if tall { px(4.) } else { px(20.) })
+                .top(if active { px(4.) } else { px(16.) })
                 .w(px(4.))
-                .h(px(if tall { 40. } else { 8. }))
-                .rounded_md()
+                .h(px(if active { 32. } else { 8. }))
+                .rounded_r(px(4.))
                 .bg(rgb(color::bright()))
                 .when(!active && !unread, |d| d.opacity(0.)),
         )
@@ -701,174 +872,813 @@ fn rail_slot(button: Stateful<Div>, active: bool, unread: bool, mentions: u32) -
         .when(mentions > 0, |d| d.child(badge(mentions)))
 }
 
+/// Squircle server button: icon image, or initials.
 fn rail_button(
     id: impl Into<SharedString>,
     active: bool,
     label: String,
-    icon: Option<Arc<Image>>,
+    image: Option<Arc<Image>>,
 ) -> Stateful<Div> {
-    let base = div().id(id.into()).size(px(48.)).cursor_pointer();
-    if let Some(icon) = icon {
-        return base.child(round_image(icon, 48., Some(if active { 16. } else { 24. })));
+    let base = div()
+        .id(id.into())
+        .size(px(40.))
+        .rounded(px(12.))
+        .overflow_hidden()
+        .cursor_pointer();
+    if let Some(image) = image {
+        return base.child(round_image(image, 40., Some(12.)));
     }
     base.flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(color::bright()))
+        .text_color(rgb(if active { 0xffffff } else { color::bright() }))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(15.))
+        .text_size(px(14.))
         .child(label)
-        .when(active, |d| d.rounded(px(16.)).bg(rgb(color::brand())))
+        .when(active, |d| d.bg(rgb(color::brand())))
         .when(!active, |d| {
-            d.rounded_full()
-                .bg(rgb(color::chat()))
-                .hover(|h| h.rounded(px(16.)).bg(rgb(color::brand())))
+            d.bg(rgb(color::active()))
+                .hover(|h| h.bg(rgb(color::brand())))
         })
 }
 
 impl DiscordApp {
     pub fn root(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = self.width < 760.;
-        let body = if self.logged_in && narrow {
-            // Phone-like layout: chat only, navigation slides over it.
-            let nav = self.nav_open.then(|| {
-                div()
-                    .id("nav-backdrop")
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba(0x00000080))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.nav_open = false;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .id("nav-panel")
-                            .h_full()
-                            .flex()
-                            .shadow_lg()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .child(self.rail(cx))
-                            .child(self.sidebar(cx)),
-                    )
-            });
-            div()
-                .size_full()
-                .relative()
-                .flex()
-                .child(self.chat(cx))
-                .children(nav)
-        } else if self.logged_in {
-            div()
-                .size_full()
-                .flex()
-                .child(self.rail(cx))
-                .child(self.sidebar(cx))
-                .child(self.chat(cx))
+        let body: AnyElement = if !self.logged_in {
+            self.login_view(cx).into_any_element()
         } else {
-            self.login_view(cx)
+            let content = if narrow {
+                // Phone-like layout: chat only, navigation slides over it.
+                let nav = self.nav_open.then(|| {
+                    div()
+                        .id("nav-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgba(0x00000080))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.nav_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .id("nav-panel")
+                                .h_full()
+                                .shadow_lg()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(self.nav_column(cx)),
+                        )
+                });
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .flex()
+                    .child(self.chat(cx))
+                    .children(nav)
+            } else {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.nav_column(cx))
+                    .child(self.chat(cx))
+            };
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(color::frame()))
+                .child(self.title_bar(cx))
+                .child(content)
+                .into_any_element()
         };
         let switcher = self.switcher.is_some().then(|| self.switcher_overlay(cx));
         let profile = self.profile.clone().map(|u| self.profile_overlay(&u, cx));
         let settings = self.settings.then(|| self.settings_overlay(cx));
+        let inbox = self.inbox_open.then(|| self.inbox_popover(cx));
+        let status = self.status_menu.then(|| self.status_popover(cx));
+        let size = match self.density.as_str() {
+            "compact" => 14.,
+            "spacious" => 16.,
+            _ => 15.,
+        };
         div()
             .id("root")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                if this.resizing {
+                    this.sidebar_width = (f32::from(ev.position.x) - 72.).clamp(180., 420.);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing {
+                        this.resizing = false;
+                        this.save_prefs();
+                        cx.notify();
+                    }
+                }),
+            )
+            .when(self.resizing, |d| d.cursor_col_resize())
             .relative()
             .size_full()
+            .font_family(crate::assets::FONT_FAMILY)
+            .bg(rgb(color::frame()))
             .text_color(rgb(color::text()))
-            .text_size(px(15.))
+            .text_size(px(size))
             .child(body)
+            .children(inbox)
+            .children(status)
             .children(profile)
             .children(settings)
             .children(switcher)
+    }
+
+    /// Thin top bar (2025 layout): current place in the middle, inbox on the right.
+    fn title_bar(&self, cx: &mut Context<Self>) -> Div {
+        let (glyph, title) = match (&self.guild, &self.channel) {
+            (None, None) => ("users", "Amis".to_string()),
+            (None, Some(c)) => ("at-sign", c.title()),
+            (Some(g), _) => (
+                "house",
+                self.guilds
+                    .iter()
+                    .find(|x| &x.id == g)
+                    .map(|x| x.name.clone())
+                    .unwrap_or_default(),
+            ),
+        };
+        let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
+        div()
+            .h(px(36.))
+            .flex_shrink_0()
+            .px_2()
+            .flex()
+            .items_center()
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(color::bright()))
+                    .child(icon(glyph, 14., color::muted()))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_end()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                icon_button(
+                                    "inbox-btn",
+                                    "inbox",
+                                    "Boîte de réception",
+                                    self.inbox_open,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_inbox(cx))),
+                            )
+                            .when(mentions > 0, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(2.))
+                                        .right(px(2.))
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .bg(rgb(color::red())),
+                                )
+                            }),
+                    )
+                    .child(
+                        icon_button("switch-btn", "search", "Changement rapide (Ctrl+K)", false)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switcher = Some(String::new());
+                                this.switcher_sel = 0;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    /// Server rail + channel sidebar + floating user panel.
+    fn nav_column(&mut self, cx: &mut Context<Self>) -> Div {
+        let narrow = self.width < 760.;
+        let sw = if narrow { 240. } else { self.sidebar_width };
+        div()
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .bg(rgb(color::frame()))
+            .child(self.rail(cx))
+            .child(self.sidebar(sw, cx))
+            .when(!narrow, |d| {
+                d.child(
+                    div()
+                        .id("resize")
+                        .absolute()
+                        .top_0()
+                        .right(px(-3.))
+                        .w(px(6.))
+                        .h_full()
+                        .cursor_col_resize()
+                        .hover(|d| d.bg(rgba(0x5865f240)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.resizing = true;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .left(px(8.))
+                    .bottom(px(8.))
+                    .w(px(72. + sw - 16.))
+                    .child(self.user_panel(cx)),
+            )
+    }
+
+    fn rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let home_active = self.guild.is_none();
+        let dm_unread = self.unread.values().any(|u| u.guild.is_none());
+        let dm_mentions: u32 = self
+            .unread
+            .values()
+            .filter(|u| u.guild.is_none())
+            .map(|u| u.mentions)
+            .sum();
+        let home = rail_slot(
+            div()
+                .id("home")
+                .size(px(40.))
+                .rounded(px(12.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when(home_active, |d| d.bg(rgb(color::brand())))
+                .when(!home_active, |d| {
+                    d.bg(rgb(color::active()))
+                        .hover(|d| d.bg(rgb(color::brand())))
+                })
+                .child(icon(
+                    "message-circle",
+                    22.,
+                    if home_active {
+                        0xffffff
+                    } else {
+                        color::bright()
+                    },
+                ))
+                .tooltip(tip("Messages privés"))
+                .on_click(cx.listener(|this, _, _, cx| this.open_home(cx))),
+            home_active,
+            dm_unread,
+            dm_mentions,
+        );
+        let guilds = self.guilds.iter().map(|g| {
+            let active = self.guild.as_deref() == Some(&g.id);
+            let id = g.id.clone();
+            let img_ = g.icon_url().and_then(|u| self.images.get(&u).cloned());
+            let mine = || {
+                self.unread
+                    .values()
+                    .filter(|u| u.guild.as_deref() == Some(&g.id))
+            };
+            let (unread, mentions) = (mine().next().is_some(), mine().map(|u| u.mentions).sum());
+            rail_slot(
+                rail_button(format!("g-{}", g.id), active, acronym(&g.name), img_)
+                    .tooltip(tip(g.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx))),
+                active,
+                unread,
+                mentions,
+            )
+        });
+        div()
+            .id("rail")
+            .w(px(72.))
+            .h_full()
+            .flex_shrink_0()
+            .pt_1()
+            .pb(px(72.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .overflow_y_scroll()
+            .child(home)
+            .child(
+                div()
+                    .w(px(24.))
+                    .h(px(1.))
+                    .flex_shrink_0()
+                    .bg(rgb(color::divider())),
+            )
+            .children(guilds)
+    }
+
+    // ---- channel sidebar -----------------------------------------------
+
+    fn sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let header: AnyElement = match &self.guild {
+            None => div()
+                .h(px(48.))
+                .flex_shrink_0()
+                .px_2()
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(rgb(color::border()))
+                .child(
+                    div()
+                        .id("dm-search")
+                        .flex_1()
+                        .h(px(30.))
+                        .px_2()
+                        .rounded(px(8.))
+                        .bg(rgb(color::input()))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(rgb(color::muted()))
+                        .child(icon("search", 14., color::muted()))
+                        .child("Rechercher ou lancer une conversation")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.switcher = Some(String::new());
+                            this.switcher_sel = 0;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            Some(id) => {
+                let name = self
+                    .guilds
+                    .iter()
+                    .find(|g| &g.id == id)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_default();
+                div()
+                    .id("guild-header")
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(color::border()))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(rgb(color::bright()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(icon("chevron-down", 18., color::bright()))
+                    .into_any_element()
+            }
+        };
+
+        let rows: Vec<AnyElement> = if self.guild.is_none() {
+            self.dm_rows(cx)
+        } else if self.channels.is_empty() {
+            (0..9)
+                .map(|i| {
+                    div()
+                        .px_2()
+                        .py(px(7.))
+                        .child(skeleton(
+                            format!("sk-ch-{i}"),
+                            Some([140., 100., 160., 120., 90., 150., 110., 130., 100.][i]),
+                            12.,
+                            Some(6.),
+                        ))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            self.channel_rows(cx)
+        };
+
+        div()
+            .w(px(width))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(color::sidebar()))
+            .rounded_tl(px(12.))
+            .border_t_1()
+            .border_l_1()
+            .border_color(rgb(color::border()))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("channel-list")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pt_2()
+                    .pb(px(72.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .children(rows),
+            )
+    }
+
+    fn user_panel(&self, cx: &mut Context<Self>) -> Div {
+        let me = self.me.clone().unwrap_or_default();
+        let st = if self.connected {
+            self.my_status.as_str()
+        } else {
+            "offline"
+        };
+        let dot = status_color(st).unwrap_or_else(color::muted);
+        div()
+            .h(px(56.))
+            .px_2()
+            .rounded(px(10.))
+            .bg(rgb(color::panel()))
+            .border_1()
+            .border_color(rgb(color::border()))
+            .shadow_md()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("me-card")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(44.))
+                    .px_1()
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .child(
+                        div().relative().child(self.avatar(&me, 32.)).child(
+                            div()
+                                .absolute()
+                                .right(px(-2.))
+                                .bottom(px(-2.))
+                                .size(px(12.))
+                                .rounded_full()
+                                .bg(rgb(dot))
+                                .border_2()
+                                .border_color(rgb(color::panel())),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(color::bright()))
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .overflow_hidden()
+                                    .child(me.display_name().to_string()),
+                            )
+                            .child(div().text_xs().text_color(rgb(color::muted())).child(
+                                if self.connected {
+                                    status_label(st)
+                                } else {
+                                    "Hors connexion"
+                                },
+                            )),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.status_menu = !this.status_menu;
+                        this.inbox_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                icon_button("settings-btn", "settings", "Paramètres utilisateur", false).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.settings = true;
+                        cx.notify();
+                    }),
+                ),
+            )
+    }
+
+    fn status_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let options = [
+            ("online", "En ligne", ""),
+            ("idle", "Inactif", ""),
+            (
+                "dnd",
+                "Ne pas déranger",
+                "Vous ne recevrez pas de notifications sur le bureau.",
+            ),
+            (
+                "invisible",
+                "Invisible",
+                "Vous apparaîtrez hors ligne, avec tous les accès.",
+            ),
+        ];
+        let panel = div()
+            .id("status-menu")
+            .absolute()
+            .left(px(16.))
+            .bottom(px(72.))
+            .w(px(260.))
+            .p_2()
+            .rounded(px(10.))
+            .bg(rgb(color::panel()))
+            .border_1()
+            .border_color(rgb(color::border()))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .children(options.into_iter().map(|(key, label, help)| {
+                let dot = status_color(key).unwrap_or_else(color::muted);
+                div()
+                    .id(SharedString::from(format!("st-{key}")))
+                    .px_2()
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(self.my_status == key, |d| d.bg(rgb(color::active())))
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .size(px(10.))
+                            .rounded_full()
+                            .when(key == "invisible", |d| {
+                                d.border_2().border_color(rgb(color::muted()))
+                            })
+                            .when(key != "invisible", |d| d.bg(rgb(dot))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(color::bright()))
+                                    .child(label),
+                            )
+                            .when(!help.is_empty(), |d| {
+                                d.child(div().text_xs().text_color(rgb(color::muted())).child(help))
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_status(key, cx)))
+            }));
+        div()
+            .id("status-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.status_menu = false;
+                cx.notify();
+            }))
+            .child(appear("status-anim", panel))
+            .into_any_element()
+    }
+
+    fn inbox_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("inbox-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2();
+        if self.inbox_loading {
+            for i in 0..4 {
+                list = list.child(skeleton(format!("sk-in-{i}"), None, 56., Some(8.)));
+            }
+        } else if self.inbox.is_empty() {
+            list = list.child(
+                div()
+                    .py_6()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .text_color(rgb(color::muted()))
+                    .child(icon("inbox", 40., color::muted()))
+                    .child("Aucune mention récente."),
+            );
+        }
+        for m in &self.inbox {
+            let place = match &m.guild_id {
+                Some(g) => self
+                    .guilds
+                    .iter()
+                    .find(|x| &x.id == g)
+                    .map(|x| x.name.clone())
+                    .unwrap_or_else(|| "Serveur".into()),
+                None => "Message privé".into(),
+            };
+            let msg = m.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("in-{}", m.id)))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .pt_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(color::muted()))
+                            .child(icon("hash", 12., color::muted()))
+                            .child(place),
+                    )
+                    .child(self.result_row(m))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_message(&msg, cx))),
+            );
+        }
+        let panel = div()
+            .id("inbox")
+            .absolute()
+            .top(px(40.))
+            .right(px(8.))
+            .w(px(420.0_f32.min(self.width - 16.)))
+            .h(px((self.height - 80.).clamp(240., 560.)))
+            .rounded(px(10.))
+            .bg(rgb(color::panel()))
+            .border_1()
+            .border_color(rgb(color::border()))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(color::border()))
+                    .child(icon("at-sign", 18., color::bright()))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(color::bright()))
+                            .child("Mentions"),
+                    ),
+            )
+            .child(list);
+        div()
+            .id("inbox-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.inbox_open = false;
+                cx.notify();
+            }))
+            .child(appear("inbox-anim", panel))
+            .into_any_element()
     }
 
     fn switcher_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let items = self.switcher_items();
         let sel = self.switcher_sel.min(items.len().saturating_sub(1));
         let query = self.switcher.clone().unwrap_or_default();
-        div()
-            .id("switcher-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .bg(rgba(0x000000a0))
-            .flex()
-            .justify_center()
-            .pt(px(110.))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.switcher = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("switcher")
-                    .w(px(560.0_f32.min(self.width - 32.)))
-                    .h_full()
-                    .max_h(px(420.))
-                    .rounded(px(8.))
-                    .bg(rgb(color::chat()))
-                    .shadow_lg()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .h(px(44.))
-                            .px_3()
-                            .rounded(px(4.))
-                            .bg(rgb(color::rail()))
-                            .flex()
-                            .items_center()
-                            .text_size(px(18.))
-                            .child(if query.is_empty() {
-                                div().flex().items_center().child(Self::caret()).child(
+        appear(
+            "switcher-backdrop-anim",
+            div()
+                .id("switcher-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x000000a0))
+                .flex()
+                .justify_center()
+                .pt(px(110.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.switcher = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("switcher")
+                        .w(px(560.0_f32.min(self.width - 32.)))
+                        .h_full()
+                        .max_h(px(420.))
+                        .rounded(px(8.))
+                        .bg(rgb(color::chat()))
+                        .shadow_lg()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .h(px(44.))
+                                .px_3()
+                                .rounded(px(4.))
+                                .bg(rgb(color::rail()))
+                                .flex()
+                                .items_center()
+                                .text_size(px(18.))
+                                .child(if query.is_empty() {
+                                    div().flex().items_center().child(Self::caret()).child(
+                                        div()
+                                            .text_color(rgb(color::muted()))
+                                            .child("Où voulez-vous aller ?"),
+                                    )
+                                } else {
                                     div()
-                                        .text_color(rgb(color::muted()))
-                                        .child("Où voulez-vous aller ?"),
+                                        .flex()
+                                        .items_center()
+                                        .child(query)
+                                        .child(Self::caret())
+                                }),
+                        )
+                        .children(items.into_iter().enumerate().map(|(i, (label, target))| {
+                            div()
+                                .id(SharedString::from(format!("sw-{i}")))
+                                .h(px(36.))
+                                .px_3()
+                                .rounded(px(4.))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .when(i == sel, |d| {
+                                    d.bg(rgb(color::active())).text_color(rgb(color::bright()))
+                                })
+                                .hover(|d| d.bg(rgb(color::hover())))
+                                .child(label)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.go(target.clone(), cx)),
                                 )
-                            } else {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .child(query)
-                                    .child(Self::caret())
-                            }),
-                    )
-                    .children(items.into_iter().enumerate().map(|(i, (label, target))| {
-                        div()
-                            .id(SharedString::from(format!("sw-{i}")))
-                            .h(px(36.))
-                            .px_3()
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .when(i == sel, |d| {
-                                d.bg(rgb(color::active())).text_color(rgb(color::bright()))
-                            })
-                            .hover(|d| d.bg(rgb(color::hover())))
-                            .child(label)
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.go(target.clone(), cx)),
-                            )
-                    }))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(color::muted()))
-                            .child("↑↓ naviguer · Entrée ouvrir · Échap fermer · Ctrl+K"),
-                    ),
-            )
-            .into_any_element()
+                        }))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(color::muted()))
+                                .child("↑↓ naviguer · Entrée ouvrir · Échap fermer · Ctrl+K"),
+                        ),
+                ),
+        )
     }
 
     // ---- text input ----------------------------------------------------
@@ -1262,143 +2072,21 @@ impl DiscordApp {
 
     // ---- server rail ---------------------------------------------------
 
-    fn rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let home_active = self.guild.is_none();
-        let dm_unread = self.unread.values().any(|u| u.guild.is_none());
-        let dm_mentions: u32 = self
-            .unread
-            .values()
-            .filter(|u| u.guild.is_none())
-            .map(|u| u.mentions)
-            .sum();
-        let home = rail_slot(
-            rail_button("home", home_active, "DM".into(), None)
-                .on_click(cx.listener(|this, _, _, cx| this.open_home(cx))),
-            home_active,
-            dm_unread,
-            dm_mentions,
-        );
-        let guilds = self.guilds.iter().map(|g| {
-            let active = self.guild.as_deref() == Some(&g.id);
-            let id = g.id.clone();
-            let icon = g.icon_url().and_then(|u| self.images.get(&u).cloned());
-            let mine = || {
-                self.unread
-                    .values()
-                    .filter(|u| u.guild.as_deref() == Some(&g.id))
-            };
-            let (unread, mentions) = (mine().next().is_some(), mine().map(|u| u.mentions).sum());
-            rail_slot(
-                rail_button(format!("g-{}", g.id), active, acronym(&g.name), icon)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx))),
-                active,
-                unread,
-                mentions,
-            )
-        });
-        div()
-            .id("rail")
-            .w(px(72.))
-            .h_full()
-            .flex_shrink_0()
-            .bg(rgb(color::rail()))
-            .py_3()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_2()
-            .overflow_y_scroll()
-            .child(home)
-            .child(
-                div()
-                    .w(px(32.))
-                    .h(px(2.))
-                    .rounded_md()
-                    .bg(rgb(color::divider())),
-            )
-            .children(guilds)
-    }
-
     // ---- channel sidebar -----------------------------------------------
-
-    fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let header_title = match &self.guild {
-            None => "Messages privés".to_string(),
-            Some(id) => self
-                .guilds
-                .iter()
-                .find(|g| &g.id == id)
-                .map(|g| g.name.clone())
-                .unwrap_or_default(),
-        };
-        let header = div()
-            .h(px(48.))
-            .flex_shrink_0()
-            .px_4()
-            .flex()
-            .items_center()
-            .border_b_1()
-            .border_color(rgb(color::rail()))
-            .text_color(rgb(color::bright()))
-            .font_weight(FontWeight::SEMIBOLD)
-            .overflow_hidden()
-            .child(header_title);
-
-        let rows: Vec<AnyElement> = if self.guild.is_none() {
-            self.dm_rows(cx)
-        } else if self.channels.is_empty() {
-            (0..9)
-                .map(|i| {
-                    div()
-                        .px_2()
-                        .py(px(6.))
-                        .child(skeleton(
-                            format!("sk-ch-{i}"),
-                            Some([140., 100., 160., 120., 90., 150., 110., 130., 100.][i]),
-                            14.,
-                            Some(6.),
-                        ))
-                        .into_any_element()
-                })
-                .collect()
-        } else {
-            self.channel_rows(cx)
-        };
-
-        div()
-            .w(px(if self.width < 900. { 200. } else { 240. }))
-            .h_full()
-            .flex_shrink_0()
-            .bg(rgb(color::sidebar()))
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(
-                div()
-                    .id("channel-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .children(rows),
-            )
-            .child(self.user_panel(cx))
-    }
 
     fn dm_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let friends_active = self.channel.is_none();
         let mut rows: Vec<AnyElement> = vec![
             div()
                 .id("friends-entry")
-                .h(px(42.))
+                .h(px(40.))
                 .px_2()
-                .rounded(px(4.))
+                .rounded(px(8.))
                 .flex()
                 .items_center()
                 .gap_3()
                 .cursor_pointer()
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(if friends_active {
                     color::bright()
                 } else {
@@ -1406,18 +2094,26 @@ impl DiscordApp {
                 }))
                 .when(friends_active, |d| d.bg(rgb(color::active())))
                 .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
-                .child(div().w(px(32.)).flex().justify_center().child("👥"))
+                .child(icon(
+                    "users",
+                    20.,
+                    if friends_active {
+                        color::bright()
+                    } else {
+                        color::muted()
+                    },
+                ))
                 .child("Amis")
                 .on_click(cx.listener(|this, _, _, cx| this.open_home(cx)))
                 .into_any_element(),
             div()
                 .px_2()
-                .pt_3()
+                .pt_4()
                 .pb_1()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(color::muted()))
-                .child("MESSAGES PRIVÉS")
+                .child("Messages privés")
                 .into_any_element(),
         ];
         for c in &self.dms {
@@ -1425,18 +2121,28 @@ impl DiscordApp {
             let chan = c.clone();
             let title = c.title();
             let pic = match c.recipients.first() {
-                Some(u) if c.recipients.len() == 1 => self.avatar_status(u, 32., color::sidebar()),
+                Some(u) if c.recipients.len() == 1 => self.avatar_status(
+                    u,
+                    32.,
+                    if active {
+                        color::active()
+                    } else {
+                        color::sidebar()
+                    },
+                ),
                 Some(u) => self.avatar(u, 32.),
                 None => initials_avatar(&c.id, &title, 32.).into_any_element(),
             };
             let unread = self.unread.get(&c.id).cloned();
             let bright = active || unread.is_some();
+            let sub =
+                (c.recipients.len() > 1).then(|| format!("{} membres", c.recipients.len() + 1));
             rows.push(
                 div()
                     .id(SharedString::from(format!("dm-{}", c.id)))
-                    .h(px(42.))
+                    .h(px(44.))
                     .px_2()
-                    .rounded(px(4.))
+                    .rounded(px(8.))
                     .flex()
                     .items_center()
                     .gap_3()
@@ -1450,7 +2156,25 @@ impl DiscordApp {
                     .when(active, |d| d.bg(rgb(color::active())))
                     .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
                     .child(pic)
-                    .child(div().flex_1().overflow_hidden().child(title))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(title),
+                            )
+                            .children(
+                                sub.map(|s| {
+                                    div().text_xs().text_color(rgb(color::muted())).child(s)
+                                }),
+                            ),
+                    )
                     .children(
                         unread
                             .filter(|u| u.mentions > 0)
@@ -1463,6 +2187,52 @@ impl DiscordApp {
             );
         }
         rows
+    }
+
+    fn category_row(&self, cat: &Channel, cx: &mut Context<Self>) -> AnyElement {
+        let collapsed = self.collapsed.contains(&cat.id);
+        let cid = cat.id.clone();
+        let group: SharedString = format!("cat-g-{}", cat.id).into();
+        div()
+            .id(SharedString::from(format!("cat-{}", cat.id)))
+            .group(group.clone())
+            .mt_4()
+            .mb_1()
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(color::muted()))
+            .hover(|d| d.text_color(rgb(color::bright())))
+            .child(
+                icon(
+                    if collapsed {
+                        "chevron-right"
+                    } else {
+                        "chevron-down"
+                    },
+                    12.,
+                    color::muted(),
+                )
+                .group_hover(group, |s| s.text_color(rgb(color::bright()))),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(cat.title().to_uppercase()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed.remove(&cid) {
+                    this.collapsed.insert(cid.clone());
+                }
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn channel_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1478,30 +2248,7 @@ impl DiscordApp {
         }
         for cat in categories {
             let collapsed = self.collapsed.contains(&cat.id);
-            let cid = cat.id.clone();
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("cat-{}", cat.id)))
-                    .mt_3()
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .cursor_pointer()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::muted()))
-                    .hover(|d| d.text_color(rgb(color::bright())))
-                    .child(if collapsed { "›" } else { "⌄" })
-                    .child(cat.title().to_uppercase())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.collapsed.remove(&cid) {
-                            this.collapsed.insert(cid.clone());
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
+            rows.push(self.category_row(cat, cx));
             if collapsed {
                 continue;
             }
@@ -1529,10 +2276,10 @@ impl DiscordApp {
                 let unread = self.unread.contains_key(&t.id);
                 div()
                     .id(SharedString::from(format!("t-{}", t.id)))
-                    .h(px(28.))
-                    .ml(px(18.))
+                    .h(px(30.))
+                    .ml(px(16.))
                     .px_2()
-                    .rounded(px(4.))
+                    .rounded(px(8.))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1545,8 +2292,16 @@ impl DiscordApp {
                     }))
                     .when(active, |d| d.bg(rgb(color::active())))
                     .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
-                    .child("⤷")
-                    .child(div().flex_1().overflow_hidden().child(t.title()))
+                    .child(icon("message-square-text", 15., color::muted()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(t.title()),
+                    )
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)),
                     )
@@ -1641,29 +2396,56 @@ impl DiscordApp {
         let chan = c.clone();
         let unread = self.unread.get(&c.id).cloned();
         let bright = active || unread.is_some();
+        let glyph = match c.kind {
+            5 => "megaphone",
+            15 | 16 => "messages-square",
+            _ => "hash",
+        };
+        let tint = if bright {
+            color::bright()
+        } else {
+            color::muted()
+        };
+        let group: SharedString = format!("ch-g-{}", c.id).into();
         div()
             .id(SharedString::from(format!("c-{}", c.id)))
-            .h(px(34.))
+            .group(group.clone())
+            .relative()
+            .h(px(32.))
             .px_2()
-            .rounded(px(4.))
+            .rounded(px(8.))
             .flex()
             .items_center()
             .gap(px(6.))
             .cursor_pointer()
-            .text_color(rgb(if bright {
-                color::bright()
-            } else {
-                color::muted()
-            }))
+            .text_color(rgb(tint))
             .when(unread.is_some(), |d| d.font_weight(FontWeight::SEMIBOLD))
             .when(active, |d| d.bg(rgb(color::active())))
             .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
+            .when(unread.is_some() && !active, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(-8.))
+                        .top(px(12.))
+                        .w(px(4.))
+                        .h(px(8.))
+                        .rounded_r(px(4.))
+                        .bg(rgb(color::bright())),
+                )
+            })
+            .child(
+                icon(glyph, 18., tint).group_hover(group, |s| s.text_color(rgb(color::bright()))),
+            )
             .child(
                 div()
-                    .text_size(px(20.))
-                    .child(if c.is_forum() { "▤" } else { "#" }),
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(c.title()),
             )
-            .child(div().flex_1().overflow_hidden().child(c.title()))
             .children(
                 unread
                     .filter(|u| u.mentions > 0)
@@ -1673,134 +2455,62 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    fn user_panel(&self, cx: &mut Context<Self>) -> Div {
-        let me = self.me.clone().unwrap_or_default();
-        div()
-            .h(px(52.))
-            .flex_shrink_0()
-            .px_2()
-            .bg(rgb(color::panel()))
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div().relative().child(self.avatar(&me, 32.)).child(
-                    div()
-                        .absolute()
-                        .right(px(-2.))
-                        .bottom(px(-2.))
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(rgb(if self.connected {
-                            color::green()
-                        } else {
-                            color::muted()
-                        }))
-                        .border_2()
-                        .border_color(rgb(color::panel())),
-                ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(color::bright()))
-                            .child(me.display_name().to_string()),
-                    )
-                    .child(div().text_xs().text_color(rgb(color::muted())).child(
-                        if self.connected {
-                            "En ligne"
-                        } else {
-                            "Hors connexion"
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .id("logout")
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .text_xs()
-                    .text_color(rgb(color::muted()))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
-                    .child("Réglages")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings = true;
-                        cx.notify();
-                    })),
-            )
-    }
-
     // ---- chat pane -----------------------------------------------------
 
     fn chat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (prefix, title) = match &self.channel {
-            Some(c) if c.is_dm() => ("@", c.title()),
-            Some(c) if c.is_thread() => ("⤷", c.title()),
-            Some(c) if c.is_forum() => ("▤", c.title()),
-            Some(c) => ("#", c.title()),
-            None if self.guild.is_none() => ("", "Amis".to_string()),
-            None => ("", String::new()),
+        let (glyph, prefix, title) = match &self.channel {
+            Some(c) if c.is_dm() => ("at-sign", "@", c.title()),
+            Some(c) if c.is_thread() => ("message-square-text", "⤷", c.title()),
+            Some(c) if c.is_forum() => ("messages-square", "▤", c.title()),
+            Some(c) if c.kind == 5 => ("megaphone", "#", c.title()),
+            Some(c) => ("hash", "#", c.title()),
+            None if self.guild.is_none() => ("users", "", "Amis".to_string()),
+            None => ("hash", "", String::new()),
         };
         let topic = self
             .channel
             .as_ref()
             .and_then(|c| c.topic.clone())
             .unwrap_or_default();
+        let compact_header = self.width < 900.;
 
+        let side = self.show_side;
         let header = div()
             .h(px(48.))
             .flex_shrink_0()
-            .px_4()
+            .px_3()
             .flex()
             .items_center()
             .gap_2()
             .border_b_1()
-            .border_color(rgb(color::rail()))
+            .border_color(rgb(color::border()))
             .when(self.width < 760., |d| {
                 d.child(
-                    div()
-                        .id("nav-toggle")
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.))
-                        .text_size(px(18.))
-                        .cursor_pointer()
-                        .text_color(rgb(color::muted()))
-                        .hover(|d| d.bg(rgb(color::hover())))
-                        .child("☰")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    icon_button("nav-toggle", "menu", "Navigation", self.nav_open).on_click(
+                        cx.listener(|this, _, _, cx| {
                             this.nav_open = !this.nav_open;
                             cx.notify();
-                        })),
+                        }),
+                    ),
                 )
             })
+            .child(icon(glyph, 22., color::muted()))
             .child(
                 div()
-                    .text_size(px(22.))
-                    .text_color(rgb(color::muted()))
-                    .child(prefix),
-            )
-            .child(
-                div()
+                    .flex_shrink_0()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(color::bright()))
                     .child(title.clone()),
             )
-            .when(!topic.is_empty(), |d| {
-                d.child(div().w(px(1.)).h(px(24.)).mx_1().bg(rgb(color::divider())))
+            .when(!topic.is_empty() && !compact_header, |d| {
+                d.child(div().w(px(1.)).h(px(20.)).mx_1().bg(rgb(color::divider())))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_sm()
                             .text_color(rgb(color::muted()))
                             .child(topic),
@@ -1808,33 +2518,57 @@ impl DiscordApp {
             })
             .child(div().flex_1())
             .when(self.channel.is_some(), |d| {
-                let side = self.show_side;
-                d.child(self.header_button(
-                    "pins-btn",
-                    "Épingles",
-                    side && self.side == Side::Pins,
-                    cx,
-                    |t, cx| t.open_pins(cx),
-                ))
-                .child(self.header_button(
-                    "members-btn",
-                    "Membres",
-                    side && self.side == Side::Members,
-                    cx,
-                    |t, cx| t.show_members_panel(cx),
-                ))
-                .child(self.header_button(
-                    "search-btn",
-                    "Rechercher",
-                    side && self.side == Side::Search,
-                    cx,
-                    |t, cx| {
-                        t.search = Some(String::new());
-                        t.side = Side::Search;
-                        t.show_side = true;
-                        cx.notify();
-                    },
-                ))
+                d.child(
+                    icon_button(
+                        "pins-btn",
+                        "pin",
+                        "Messages épinglés",
+                        side && self.side == Side::Pins,
+                    )
+                    .on_click(cx.listener(|t, _, _, cx| t.open_pins(cx))),
+                )
+                .child(
+                    icon_button(
+                        "members-btn",
+                        "users",
+                        "Afficher la liste des membres",
+                        side && self.side == Side::Members,
+                    )
+                    .on_click(cx.listener(|t, _, _, cx| t.show_members_panel(cx))),
+                )
+                .child(
+                    div()
+                        .id("search-btn")
+                        .ml_1()
+                        .w(px(if compact_header { 32. } else { 180. }))
+                        .h(px(28.))
+                        .px_2()
+                        .rounded(px(8.))
+                        .bg(rgb(color::frame()))
+                        .border_1()
+                        .border_color(rgb(if side && self.side == Side::Search {
+                            color::brand()
+                        } else {
+                            color::border()
+                        }))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_text()
+                        .text_size(px(13.))
+                        .text_color(rgb(color::muted()))
+                        .when(!compact_header, |d| {
+                            d.child(div().flex_1().child("Rechercher"))
+                        })
+                        .child(icon("search", 15., color::muted()))
+                        .tooltip(tip("Rechercher (Ctrl+F)"))
+                        .on_click(cx.listener(|t, _, _, cx| {
+                            t.search = Some(String::new());
+                            t.side = Side::Search;
+                            t.show_side = true;
+                            cx.notify();
+                        })),
+                )
             });
 
         let forbidden = self
@@ -1848,10 +2582,19 @@ impl DiscordApp {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_2()
+                .gap_3()
                 .px_4()
                 .text_center()
-                .child(div().text_size(px(40.)).child("🔒"))
+                .child(
+                    div()
+                        .size(px(72.))
+                        .rounded_full()
+                        .bg(rgb(color::input()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon("lock", 32., color::muted())),
+                )
                 .child(
                     div()
                         .text_size(px(20.))
@@ -1874,15 +2617,20 @@ impl DiscordApp {
                 div()
                     .id("older")
                     .mx_4()
-                    .mt_2()
-                    .py_1()
+                    .mt_3()
+                    .h(px(32.))
                     .flex()
+                    .items_center()
                     .justify_center()
-                    .rounded(px(4.))
+                    .gap_2()
+                    .rounded(px(8.))
+                    .bg(rgb(color::input()))
                     .text_sm()
-                    .text_color(rgb(color::link()))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(color::text()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(color::hover())))
+                    .hover(|d| d.bg(rgb(color::active())))
+                    .child(icon("clock", 14., color::muted()))
                     .child(if self.loading_older {
                         "Chargement…"
                     } else {
@@ -1890,7 +2638,17 @@ impl DiscordApp {
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.load_older(cx)))
             });
-            let rows = self.message_rows(cx);
+            let mut index = Vec::new();
+            let rows = self.message_rows(&mut index, cx);
+            // Children before the first row: [older] + welcome.
+            let offset = usize::from(older.is_some()) + 1;
+            if let Some(id) = self.jump_to.clone() {
+                if let Some((_, ix)) = index.iter().find(|(m, _)| *m == id) {
+                    self.scroll.scroll_to_item(ix + offset);
+                    self.flash = Some((id, std::time::Instant::now()));
+                    self.jump_to = None;
+                }
+            }
             let away = {
                 let max = self.scroll.max_offset().height;
                 max > px(0.) && self.scroll.offset().y < -max + px(160.)
@@ -1900,20 +2658,33 @@ impl DiscordApp {
                     .id("jump-bottom")
                     .absolute()
                     .bottom(px(12.))
-                    .right(px(24.))
-                    .px_3()
-                    .py_1()
-                    .rounded_full()
-                    .bg(rgb(color::brand()))
-                    .shadow_lg()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(rgb(0xffffff))
-                    .child("Aller aux derniers messages ↓")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll.scroll_to_bottom();
-                        cx.notify();
-                    }))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("jump-pill")
+                            .px_3()
+                            .h(px(30.))
+                            .rounded_full()
+                            .bg(rgb(color::brand()))
+                            .hover(|d| d.bg(rgb(color::brand_hover())))
+                            .shadow_lg()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xffffff))
+                            .child("Aller aux messages récents")
+                            .child(icon("arrow-down", 14., 0xffffff))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.scroll.scroll_to_bottom();
+                                cx.notify();
+                            })),
+                    )
             });
             div()
                 .relative()
@@ -1933,7 +2704,7 @@ impl DiscordApp {
                         .children(older)
                         .child(self.welcome(prefix, &title))
                         .children(rows)
-                        .child(div().h(px(16.)).flex_shrink_0()),
+                        .child(div().h(px(20.)).flex_shrink_0()),
                 )
                 .children(jump)
                 .into_any_element()
@@ -1943,9 +2714,12 @@ impl DiscordApp {
             div()
                 .flex_1()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap_2()
                 .text_color(rgb(color::muted()))
+                .child(icon("hash", 40., color::muted()))
                 .child("Choisissez un salon.")
                 .into_any_element()
         };
@@ -1958,11 +2732,18 @@ impl DiscordApp {
             format!("Envoyer un message dans #{title}")
         };
 
-        // Reply / edit banner attached on top of the composer.
         let banner: Option<AnyElement> = if let Some(r) = &self.replying {
-            Some(self.banner(format!("Réponse à {}", r.author.display_name()), cx))
+            Some(self.banner(
+                "reply",
+                format!("Réponse à {}", r.author.display_name()),
+                cx,
+            ))
         } else if self.editing.is_some() {
-            Some(self.banner("Modification du message · Échap pour annuler".into(), cx))
+            Some(self.banner(
+                "pencil",
+                "Modification du message · Échap pour annuler".into(),
+                cx,
+            ))
         } else {
             None
         };
@@ -1976,19 +2757,20 @@ impl DiscordApp {
         let locked = (self.channel.is_some() && cannot_send).then(|| {
             div().px_4().pb(px(24.)).flex_shrink_0().child(
                 div()
-                    .min_h(px(44.))
+                    .h(px(52.))
                     .px_4()
-                    .rounded(px(8.))
+                    .rounded(px(10.))
                     .bg(rgb(color::input()))
-                    .opacity(0.7)
                     .flex()
                     .items_center()
+                    .gap_3()
                     .text_color(rgb(color::muted()))
-                    .child(
-                        "🔒  Vous n'avez pas la permission d'envoyer des messages dans ce salon.",
-                    ),
+                    .child(icon("lock", 18., color::muted()))
+                    .child("Vous n'avez pas la permission d'envoyer des messages dans ce salon."),
             )
         });
+        let picker_open = self.picker.is_some();
+        let gif_open = picker_open && self.picker_tab == PickerTab::Gif;
         let composer = (self.channel.is_some() && !cannot_send).then(|| {
             div()
                 .px_4()
@@ -1999,63 +2781,98 @@ impl DiscordApp {
                 .children(banner)
                 .child(
                     div()
-                        .min_h(px(44.))
-                        .py(px(10.))
-                        .px_4()
-                        .when(has_banner, |d| d.rounded_b(px(8.)))
-                        .when(!has_banner, |d| d.rounded(px(8.)))
+                        .min_h(px(52.))
+                        .py(px(14.))
+                        .pl_3()
+                        .pr_2()
+                        .when(has_banner, |d| d.rounded_b(px(10.)))
+                        .when(!has_banner, |d| d.rounded(px(10.)))
                         .bg(rgb(color::input()))
+                        .border_1()
+                        .border_color(rgb(color::border()))
                         .flex()
                         .items_start()
                         .gap_3()
                         .child(
                             div()
                                 .id("upload")
-                                .size(px(24.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(rgb(color::muted()))
-                                .hover(|d| d.bg(rgb(color::bright())))
+                                .group("upload")
+                                .mt(px(-2.))
                                 .cursor_pointer()
-                                .text_color(rgb(color::input()))
-                                .font_weight(FontWeight::BOLD)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child("+")
+                                .child(
+                                    icon("circle-plus", 24., color::muted())
+                                        .group_hover("upload", |s| {
+                                            s.text_color(rgb(color::bright()))
+                                        }),
+                                )
+                                .tooltip(tip("Envoyer un fichier"))
                                 .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx))),
                         )
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
                                 .overflow_hidden()
                                 .child(self.input_line(placeholder, false)),
                         )
                         .child(
                             div()
-                                .id("emoji-btn")
-                                .flex_shrink_0()
-                                .cursor_pointer()
-                                .opacity(0.8)
-                                .hover(|d| d.opacity(1.))
-                                .child("🙂")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.picker_tab = PickerTab::Emoji;
-                                    this.gif_typing = false;
-                                    this.picker = match this.picker {
-                                        Some(_) => None,
-                                        None => Some(Picker::Composer),
-                                    };
-                                    cx.notify();
-                                })),
+                                .mt(px(-6.))
+                                .flex()
+                                .items_center()
+                                .child(icon_button("gif-btn", "image", "GIF", gif_open).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.picker = Some(Picker::Composer);
+                                        this.open_gif_tab(cx);
+                                    }),
+                                ))
+                                .child(
+                                    icon_button(
+                                        "emoji-btn",
+                                        "smile",
+                                        "Émojis",
+                                        picker_open && !gif_open,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.picker_tab = PickerTab::Emoji;
+                                            this.gif_typing = false;
+                                            this.picker = match this.picker {
+                                                Some(_) => None,
+                                                None => Some(Picker::Composer),
+                                            };
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
                         ),
                 )
                 .child(
                     div()
                         .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .text_xs()
-                        .text_color(rgb(color::bright()))
-                        .child(self.typing_text().unwrap_or_default()),
+                        .text_color(rgb(color::text()))
+                        .when_some(self.typing_text(), |d, t| {
+                            d.child(div().flex().gap(px(3.)).children((0..3).map(|i| {
+                                div()
+                                    .size(px(5.))
+                                    .rounded_full()
+                                    .bg(rgb(color::bright()))
+                                    .with_animation(
+                                        SharedString::from(format!("typing-{i}")),
+                                        Animation::new(std::time::Duration::from_millis(
+                                            900 + i * 150,
+                                        ))
+                                        .repeat()
+                                        .with_easing(pulsating_between(0.25, 1.)),
+                                        |d, v| d.opacity(v),
+                                    )
+                            })))
+                            .child(div().font_weight(FontWeight::MEDIUM).child(t))
+                        }),
                 )
         });
 
@@ -2069,12 +2886,20 @@ impl DiscordApp {
             .child(body)
             .when(!self.status.is_empty(), |d| {
                 d.child(
-                    div()
-                        .px_4()
-                        .pb_1()
-                        .text_sm()
-                        .text_color(rgb(color::red()))
-                        .child(self.status.clone()),
+                    div().px_4().pb_2().child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(rgba((color::red() << 8) | 0x26))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(rgb(color::red()))
+                            .child(icon("circle-alert", 16., color::red()))
+                            .child(self.status.clone()),
+                    ),
                 )
             })
             .children(composer)
@@ -2088,6 +2913,9 @@ impl DiscordApp {
             .min_w_0()
             .h_full()
             .bg(rgb(color::chat()))
+            .border_t_1()
+            .border_l_1()
+            .border_color(rgb(color::border()))
             .flex()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.upload(paths.paths().to_vec(), cx)
@@ -2103,9 +2931,9 @@ impl DiscordApp {
                     d.child(
                         div()
                             .absolute()
-                            .top_0()
+                            .top(px(48.))
+                            .bottom_0()
                             .right_0()
-                            .h_full()
                             .shadow_lg()
                             .child(self.side_panel(cx)),
                     )
@@ -2335,55 +3163,57 @@ impl DiscordApp {
                         .on_click(cx.listener(move |this, _, _, cx| this.pick_emoji(&e, cx)))
                 })));
         }
-        div()
-            .id("emoji-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.picker = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("emoji-picker")
-                    .absolute()
-                    .right(px(24.))
-                    .bottom(px(84.))
-                    .w(px(360.0_f32.min(self.width - 32.)))
-                    .h(px(340.))
-                    .rounded(px(8.))
-                    .bg(rgb(color::sidebar()))
-                    .border_1()
-                    .border_color(rgb(color::rail()))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(self.picker_tabs(cx))
-                    .child(if self.picker_tab == PickerTab::Gif && composer {
-                        self.gif_body(cx)
-                    } else {
-                        body.into_any_element()
-                    }),
-            )
-            .into_any_element()
+        appear(
+            "emoji-backdrop-anim",
+            div()
+                .id("emoji-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.picker = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("emoji-picker")
+                        .absolute()
+                        .right(px(24.))
+                        .bottom(px(84.))
+                        .w(px(360.0_f32.min(self.width - 32.)))
+                        .h(px(340.))
+                        .rounded(px(8.))
+                        .bg(rgb(color::sidebar()))
+                        .border_1()
+                        .border_color(rgb(color::rail()))
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(self.picker_tabs(cx))
+                        .child(if self.picker_tab == PickerTab::Gif && composer {
+                            self.gif_body(cx)
+                        } else {
+                            body.into_any_element()
+                        }),
+                ),
+        )
     }
 
     fn friends_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.friends.is_empty() {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(color::muted()))
-                .child("Aucun ami à afficher pour le moment.")
-                .into_any_element();
-        }
-        let mut sorted_friends = self.friends.clone();
-        sorted_friends.sort_by_key(|u| {
+        let online = |u: &User| {
+            matches!(
+                self.presence.get(&u.id).map(|s| s.as_str()),
+                Some("online") | Some("idle") | Some("dnd")
+            )
+        };
+        let mut list: Vec<&User> = self
+            .friends
+            .iter()
+            .filter(|u| self.friends_all || online(u))
+            .collect();
+        list.sort_by_key(|u| {
             let rank = match self.presence.get(&u.id).map(|s| s.as_str()) {
                 Some("online") => 0,
                 Some("idle") => 1,
@@ -2392,33 +3222,102 @@ impl DiscordApp {
             };
             (rank, u.display_name().to_lowercase())
         });
-        div()
+        let n_online = self.friends.iter().filter(|u| online(u)).count();
+        let tab = |id: &'static str, label: String, on: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .h(px(28.))
+                .rounded(px(8.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(if on { color::bright() } else { color::muted() }))
+                .when(on, |d| d.bg(rgb(color::active())))
+                .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
+                .child(label)
+        };
+        let header = div()
+            .px_6()
+            .pt_4()
+            .pb_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                tab("ft-online", "En ligne".into(), !self.friends_all).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.friends_all = false;
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                tab("ft-all", "Tous".into(), self.friends_all).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.friends_all = true;
+                        cx.notify();
+                    },
+                )),
+            );
+        let label = if self.friends_all {
+            format!("TOUS LES AMIS — {}", self.friends.len())
+        } else {
+            format!("EN LIGNE — {n_online}")
+        };
+        let mut body = div()
             .id("friends")
             .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
-            .p_4()
+            .px_6()
+            .pb_4()
             .flex()
             .flex_col()
-            .child(
+            .child(div().py_2().child(Self::section_label(label)));
+        if list.is_empty() {
+            body = body.child(
                 div()
-                    .pb_2()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
+                    .py_12()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_3()
                     .text_color(rgb(color::muted()))
-                    .child(format!("AMIS — {}", self.friends.len())),
-            )
-            .children(sorted_friends.iter().map(|u| {
-                let user = u.clone();
-                let st = self
-                    .presence
-                    .get(&u.id)
-                    .map(|s| s.as_str())
-                    .unwrap_or("offline");
+                    .child(
+                        div()
+                            .size(px(96.))
+                            .rounded_full()
+                            .bg(rgb(color::input()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("users", 44., color::muted())),
+                    )
+                    .child(if self.friends_all {
+                        "Aucun ami à afficher pour le moment."
+                    } else {
+                        "Personne n'est en ligne pour le moment."
+                    }),
+            );
+        }
+        for u in list {
+            let st = self
+                .presence
+                .get(&u.id)
+                .map(|s| s.as_str())
+                .unwrap_or("offline");
+            let (open, dm, prof) = (u.clone(), u.clone(), u.clone());
+            let g: SharedString = format!("fr-{}", u.id).into();
+            body = body.child(
                 div()
                     .id(SharedString::from(format!("f-{}", u.id)))
-                    .h(px(60.))
+                    .group(g.clone())
+                    .h(px(62.))
                     .px_3()
-                    .rounded(px(8.))
+                    .rounded(px(10.))
                     .border_t_1()
                     .border_color(rgb(color::divider()))
                     .flex()
@@ -2429,23 +3328,70 @@ impl DiscordApp {
                     .child(self.avatar_status(u, 36., color::chat()))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(color::bright()))
-                                    .child(u.display_name().to_string()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(color::bright()))
+                                            .child(u.display_name().to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(color::muted()))
+                                            .opacity(0.)
+                                            .group_hover(g.clone(), |s| s.opacity(1.))
+                                            .child(u.username.clone()),
+                                    ),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(color::muted()))
-                                    .child(format!("{} · {}", status_label(st), u.username)),
+                                    .child(status_label(st)),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_dm_with(&user, cx)))
-            }))
+                    .child(
+                        icon_button(
+                            format!("fdm-{}", u.id),
+                            "message-circle",
+                            "Envoyer un message",
+                            false,
+                        )
+                        .bg(rgb(color::frame()))
+                        .rounded_full()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_dm_with(&dm, cx)
+                        })),
+                    )
+                    .child(
+                        icon_button(format!("fpr-{}", u.id), "user", "Voir le profil", false)
+                            .bg(rgb(color::frame()))
+                            .rounded_full()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_profile(prof.clone(), cx)
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_dm_with(&open, cx))),
+            );
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
             .into_any_element()
     }
 
@@ -2504,28 +3450,29 @@ impl DiscordApp {
         )
     }
 
-    fn banner(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
+    fn banner(&self, glyph: &str, text: String, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .px_4()
-            .py(px(6.))
-            .rounded_t(px(8.))
-            .bg(rgb(color::sidebar()))
+            .px_3()
+            .py(px(8.))
+            .rounded_t(px(10.))
+            .bg(rgb(color::panel()))
+            .border_1()
+            .border_b_0()
+            .border_color(rgb(color::border()))
             .flex()
             .items_center()
+            .gap_2()
             .text_sm()
             .text_color(rgb(color::muted()))
+            .child(icon(glyph, 14., color::muted()))
             .child(div().flex_1().overflow_hidden().child(text))
             .child(
-                div()
-                    .id("cancel-compose")
-                    .px_2()
-                    .cursor_pointer()
-                    .hover(|d| d.text_color(rgb(color::bright())))
-                    .child("✕")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("cancel-compose", "x", "Annuler (Échap)", false).on_click(cx.listener(
+                    |this, _, _, cx| {
                         this.cancel_compose();
                         cx.notify();
-                    })),
+                    },
+                )),
             )
             .into_any_element()
     }
@@ -2793,31 +3740,6 @@ impl DiscordApp {
                         text
                     })),
             )
-    }
-
-    fn header_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        active: bool,
-        cx: &mut Context<Self>,
-        on: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .px_2()
-            .py_1()
-            .rounded(px(4.))
-            .text_sm()
-            .cursor_pointer()
-            .text_color(rgb(if active {
-                color::bright()
-            } else {
-                color::muted()
-            }))
-            .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| on(this, cx)))
     }
 
     fn profile_overlay(&self, user: &User, cx: &mut Context<Self>) -> AnyElement {
@@ -3110,99 +4032,105 @@ impl DiscordApp {
                 .child(label)
         };
         let max_h = (self.height - 48.).max(240.);
-        div()
-            .id("profile-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .bg(rgba(0x000000a0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.profile = None;
-                this.profile_data = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("profile")
-                    .w(px(420.0_f32.min(self.width - 32.)))
-                    .max_h(px(max_h))
-                    .rounded(px(8.))
-                    .bg(rgb(color::sidebar()))
-                    .shadow_lg()
-                    .overflow_y_scroll()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(banner)
-                    .child(
-                        div()
-                            .px_4()
-                            .pb_4()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .mt(px(-44.))
-                                    .size(px(96.))
-                                    .rounded_full()
-                                    .bg(rgb(color::sidebar()))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(self.avatar_status(&u, 84., color::sidebar())),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(name_row)
-                                    .child(div().text_color(rgb(color::muted())).child(sub))
-                                    .children(status.map(|s| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(color::muted()))
-                                            .child(status_label(s))
-                                    })),
-                            )
-                            .when(any_badge, |d| d.child(badges))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .when(!is_me, |d| {
-                                        d.child(
-                                            button("Envoyer un message", "profile-dm", true)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.profile = None;
-                                                    if this.guild.is_some() {
-                                                        this.guild = None;
-                                                        this.channels.clear();
-                                                    }
-                                                    this.open_dm_with(&u2, cx);
-                                                })),
-                                        )
-                                    })
-                                    .child(button("Copier l'ID", "profile-copy", false).on_click(
-                                        cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                id.clone(),
-                                            ))
-                                        }),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .p_3()
-                                    .rounded(px(8.))
-                                    .bg(rgb(color::chat()))
-                                    .child(body),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        appear(
+            "profile-backdrop-anim",
+            div()
+                .id("profile-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x000000a0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.profile = None;
+                    this.profile_data = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("profile")
+                        .w(px(420.0_f32.min(self.width - 32.)))
+                        .max_h(px(max_h))
+                        .rounded(px(8.))
+                        .bg(rgb(color::sidebar()))
+                        .shadow_lg()
+                        .overflow_y_scroll()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(banner)
+                        .child(
+                            div()
+                                .px_4()
+                                .pb_4()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .mt(px(-44.))
+                                        .size(px(96.))
+                                        .rounded_full()
+                                        .bg(rgb(color::sidebar()))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(self.avatar_status(&u, 84., color::sidebar())),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(name_row)
+                                        .child(div().text_color(rgb(color::muted())).child(sub))
+                                        .children(status.map(|s| {
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(color::muted()))
+                                                .child(status_label(s))
+                                        })),
+                                )
+                                .when(any_badge, |d| d.child(badges))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .when(!is_me, |d| {
+                                            d.child(
+                                                button("Envoyer un message", "profile-dm", true)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.profile = None;
+                                                            if this.guild.is_some() {
+                                                                this.guild = None;
+                                                                this.channels.clear();
+                                                            }
+                                                            this.open_dm_with(&u2, cx);
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            button("Copier l'ID", "profile-copy", false).on_click(
+                                                cx.listener(move |_, _, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(id.clone()),
+                                                    )
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .p_3()
+                                        .rounded(px(8.))
+                                        .bg(rgb(color::chat()))
+                                        .child(body),
+                                ),
+                        ),
+                ),
+        )
     }
 
     fn chip(text: &str, bg: u32, fg: u32) -> Div {
@@ -3219,35 +4147,410 @@ impl DiscordApp {
 
     fn settings_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let me = self.me.clone().unwrap_or_default();
-        let toggle = |id: &'static str, label: &'static str, on: bool| {
+        let tabs: [(&str, &str); 4] = [
+            ("user", "Mon compte"),
+            ("palette", "Apparence"),
+            ("bell", "Notifications"),
+            ("sliders-horizontal", "Avancé"),
+        ];
+        let toggle = |id: &'static str, label: &'static str, help: &'static str, on: bool| {
             div()
                 .id(id)
-                .h(px(40.))
+                .py_3()
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap_4()
                 .cursor_pointer()
-                .child(label)
+                .border_b_1()
+                .border_color(rgb(color::border()))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(color::bright()))
+                                .child(label),
+                        )
+                        .child(div().text_sm().text_color(rgb(color::muted())).child(help)),
+                )
                 .child(
                     div()
                         .w(px(40.))
-                        .h(px(22.))
+                        .h(px(24.))
+                        .flex_shrink_0()
                         .rounded_full()
-                        .bg(rgb(if on { color::green() } else { color::muted() }))
+                        .bg(rgb(if on { color::brand() } else { color::active() }))
                         .flex()
                         .items_center()
                         .when(on, |d| d.justify_end())
                         .px(px(3.))
-                        .child(div().size(px(16.)).rounded_full().bg(rgb(0xffffff))),
+                        .child(
+                            div()
+                                .size(px(18.))
+                                .rounded_full()
+                                .bg(rgb(0xffffff))
+                                .shadow_sm()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(
+                                    if on { "check" } else { "x" },
+                                    12.,
+                                    if on { color::brand() } else { color::muted() },
+                                )),
+                        ),
                 )
         };
+        let heading = |t: &str| {
+            div()
+                .mb_3()
+                .text_size(px(20.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(color::bright()))
+                .child(t.to_string())
+        };
+
+        let content: AnyElement = match self.settings_tab {
+            1 => {
+                let cards = color::Theme::ALL.into_iter().map(|t| {
+                    let selected = self.theme == t;
+                    // Preview colours of that theme.
+                    let prev = color::theme();
+                    color::set_theme(t);
+                    let (frame, side, chat, text, bright) =
+                        (color::frame(), color::sidebar(), color::chat(), color::muted(), color::bright());
+                    color::set_theme(prev);
+                    div()
+                        .id(SharedString::from(format!("theme-{}", t.key())))
+                        .w(px(132.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .h(px(84.))
+                                .rounded(px(10.))
+                                .overflow_hidden()
+                                .border_2()
+                                .border_color(rgb(if selected { color::brand() } else { color::border() }))
+                                .bg(rgb(frame))
+                                .flex()
+                                .p(px(6.))
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .children((0..3).map(|_| div().size(px(12.)).rounded(px(4.)).bg(rgb(side)))),
+                                )
+                                .child(div().w(px(30.)).rounded(px(4.)).bg(rgb(side)))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .rounded(px(4.))
+                                        .bg(rgb(chat))
+                                        .p(px(4.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(div().w(px(36.)).h(px(4.)).rounded_full().bg(rgb(bright)))
+                                        .child(div().w(px(48.)).h(px(4.)).rounded_full().bg(rgb(text)))
+                                        .child(div().w(px(28.)).h(px(4.)).rounded_full().bg(rgb(text))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(if selected { color::bright() } else { color::muted() }))
+                                .when(selected, |d| d.child(icon("check", 14., color::brand())))
+                                .child(t.label()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_theme(t, cx)))
+                });
+                let dens = [("compact", "Compacte"), ("default", "Par défaut"), ("spacious", "Spacieuse")];
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(heading("Apparence"))
+                    .child(Self::section_label("THÈME".into()))
+                    .child(div().flex().flex_wrap().gap_4().children(cards))
+                    .child(div().h(px(12.)))
+                    .child(Self::section_label("DENSITÉ DE L'INTERFACE".into()))
+                    .child(
+                        div()
+                            .p_1()
+                            .rounded(px(10.))
+                            .bg(rgb(color::frame()))
+                            .flex()
+                            .gap_1()
+                            .children(dens.into_iter().map(|(k, label)| {
+                                let on = self.density == k;
+                                div()
+                                    .id(SharedString::from(format!("dens-{k}")))
+                                    .flex_1()
+                                    .h(px(32.))
+                                    .rounded(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(if on { color::bright() } else { color::muted() }))
+                                    .when(on, |d| d.bg(rgb(color::active())).shadow_sm())
+                                    .hover(|d| d.text_color(rgb(color::bright())))
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.set_density(k, cx)))
+                            })),
+                    )
+                    .into_any_element()
+            }
+            2 => div()
+                .flex()
+                .flex_col()
+                .child(heading("Notifications"))
+                .child(
+                    toggle(
+                        "set-notif",
+                        "Notifications du bureau",
+                        "Pour les mentions et les messages privés quand la fenêtre n'est pas active.",
+                        self.notifications,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.notifications = !this.notifications;
+                        this.save_prefs();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    toggle(
+                        "set-title",
+                        "Compteur dans le titre de la fenêtre",
+                        "Affiche « (3) Discord » quand vous avez des mentions non lues.",
+                        self.title_badge,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.title_badge = !this.title_badge;
+                        this.save_prefs();
+                        cx.notify();
+                    })),
+                )
+                .into_any_element(),
+            3 => div()
+                .flex()
+                .flex_col()
+                .child(heading("Avancé"))
+                .child(
+                    toggle(
+                        "set-side",
+                        "Panneau latéral",
+                        "Liste des membres, recherche et épingles à droite du chat.",
+                        self.show_side,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_side = !this.show_side;
+                        this.save_prefs();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    div()
+                        .mt_4()
+                        .text_sm()
+                        .text_color(rgb(color::muted()))
+                        .child("Icônes Lucide (ISC) · Police Inter (OFL) · Interface GPUI"),
+                )
+                .into_any_element(),
+            _ => {
+                let banner: AnyElement = match me.banner_url().and_then(|b| self.images.get(&b).cloned()) {
+                    Some(i) => img(i).w_full().h(px(100.)).object_fit(ObjectFit::Cover).into_any_element(),
+                    None => div()
+                        .w_full()
+                        .h(px(100.))
+                        .bg(linear_gradient(
+                            90.,
+                            linear_color_stop(rgb(color::brand()), 0.),
+                            linear_color_stop(rgb(0xeb459e), 1.),
+                        ))
+                        .into_any_element(),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(heading("Mon compte"))
+                    .child(
+                        div()
+                            .rounded(px(12.))
+                            .overflow_hidden()
+                            .bg(rgb(color::frame()))
+                            .child(banner)
+                            .child(
+                                div()
+                                    .px_4()
+                                    .pb_4()
+                                    .flex()
+                                    .items_end()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .mt(px(-30.))
+                                            .p(px(5.))
+                                            .rounded_full()
+                                            .bg(rgb(color::frame()))
+                                            .child(self.avatar(&me, 72.)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_size(px(18.))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(rgb(color::bright()))
+                                                    .child(me.display_name().to_string()),
+                                            )
+                                            .child(div().text_sm().text_color(rgb(color::muted())).child(me.username.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("my-profile")
+                                            .px_3()
+                                            .h(px(32.))
+                                            .rounded(px(8.))
+                                            .bg(rgb(color::brand()))
+                                            .hover(|d| d.bg(rgb(color::brand_hover())))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(0xffffff))
+                                            .child("Voir le profil")
+                                            .on_click({
+                                                let me = me.clone();
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.settings = false;
+                                                    this.open_profile(me.clone(), cx);
+                                                })
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("set-logout")
+                            .mt_4()
+                            .w(px(160.))
+                            .h(px(36.))
+                            .rounded(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .bg(rgb(color::red()))
+                            .hover(|d| d.opacity(0.9))
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xffffff))
+                            .child(icon("log-out", 16., 0xffffff))
+                            .child("Se déconnecter")
+                            .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        let nav = div()
+            .w(px(200.))
+            .flex_shrink_0()
+            .p_3()
+            .bg(rgb(color::sidebar()))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(Self::section_label("PARAMÈTRES".into()))
+            .children(tabs.into_iter().enumerate().map(|(i, (glyph, label))| {
+                let on = self.settings_tab as usize == i;
+                div()
+                    .id(SharedString::from(format!("stab-{i}")))
+                    .h(px(34.))
+                    .px_2()
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if on { color::bright() } else { color::muted() }))
+                    .when(on, |d| d.bg(rgb(color::active())))
+                    .hover(|d| d.bg(rgb(color::hover())).text_color(rgb(color::bright())))
+                    .child(icon(
+                        glyph,
+                        16.,
+                        if on { color::bright() } else { color::muted() },
+                    ))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_tab = i as u8;
+                        cx.notify();
+                    }))
+            }));
+
+        let wide = self.width >= 700.;
+        let panel = div()
+            .id("settings")
+            .w(px(780.0_f32.min(self.width - 32.)))
+            .h(px((self.height - 64.).clamp(320., 560.)))
+            .rounded(px(14.))
+            .overflow_hidden()
+            .bg(rgb(color::chat()))
+            .border_1()
+            .border_color(rgb(color::border()))
+            .shadow_lg()
+            .flex()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .when(wide, |d| d.child(nav))
+            .child(
+                div()
+                    .id("settings-body")
+                    .flex_1()
+                    .min_w_0()
+                    .relative()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .child(content)
+                    .child(div().absolute().top(px(12.)).right(px(12.)).child(
+                        icon_button("set-close", "x", "Fermer (Échap)", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.settings = false;
+                                cx.notify();
+                            }),
+                        ),
+                    )),
+            );
         div()
             .id("settings-backdrop")
             .absolute()
             .top_0()
             .left_0()
             .size_full()
-            .bg(rgba(0x000000a0))
+            .bg(rgba(0x000000b0))
             .flex()
             .items_center()
             .justify_center()
@@ -3255,127 +4558,7 @@ impl DiscordApp {
                 this.settings = false;
                 cx.notify();
             }))
-            .child(
-                div()
-                    .id("settings")
-                    .w(px(480.0_f32.min(self.width - 32.)))
-                    .rounded(px(8.))
-                    .bg(rgb(color::chat()))
-                    .shadow_lg()
-                    .p_5()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_size(px(20.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(color::bright()))
-                            .child("Paramètres utilisateur"),
-                    )
-                    .child(Self::section_label("MON COMPTE".into()))
-                    .child(
-                        div()
-                            .p_3()
-                            .rounded(px(8.))
-                            .bg(rgb(color::sidebar()))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(self.avatar(&me, 48.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(color::bright()))
-                                            .child(me.display_name().to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(color::muted()))
-                                            .child(me.username.clone()),
-                                    ),
-                            ),
-                    )
-                    .child(Self::section_label("APPLICATION".into()))
-                    .child(
-                        toggle("set-theme", "Thème clair", self.light)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
-                    )
-                    .child(
-                        toggle("set-notif", "Notifications du bureau", self.notifications)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.notifications = !this.notifications;
-                                this.save_prefs();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        toggle("set-side", "Afficher le panneau latéral", self.show_side).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.show_side = !this.show_side;
-                                this.save_prefs();
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        toggle(
-                            "set-title",
-                            "Afficher les mentions dans le titre de la fenêtre",
-                            self.title_badge,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.title_badge = !this.title_badge;
-                            this.save_prefs();
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("set-logout")
-                                    .h(px(36.))
-                                    .px_4()
-                                    .rounded(px(3.))
-                                    .flex()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .bg(rgb(color::red()))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .child("Se déconnecter")
-                                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
-                            )
-                            .child(
-                                div()
-                                    .id("set-close")
-                                    .h(px(36.))
-                                    .px_4()
-                                    .rounded(px(3.))
-                                    .flex()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .bg(rgb(color::active()))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .child("Fermer")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
+            .child(appear("settings-anim", panel))
             .into_any_element()
     }
 
@@ -3413,7 +4596,11 @@ impl DiscordApp {
             }))
     }
 
-    fn message_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn message_rows(
+        &self,
+        index: &mut Vec<(String, usize)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let mut rows = Vec::with_capacity(self.messages.len());
         let mut prev: Option<(&Message, DateTime<Local>)> = None;
         for m in &self.messages {
@@ -3423,12 +4610,16 @@ impl DiscordApp {
                 (None, Some(_)) => true,
                 _ => false,
             };
+            let is_new = self.new_since.as_deref() == Some(&m.id);
             if new_day {
                 if let Some(t) = &time {
-                    rows.push(Self::day_divider(t));
+                    rows.push(Self::day_divider(t, is_new));
                 }
+            } else if is_new {
+                rows.push(Self::new_divider());
             }
             let grouped = !new_day
+                && !is_new
                 && m.kind != 19
                 && !matches!(m.kind, 1..=18 | 21)
                 && match (&prev, &time) {
@@ -3437,6 +4628,7 @@ impl DiscordApp {
                     }
                     _ => false,
                 };
+            index.push((m.id.clone(), rows.len()));
             rows.push(self.message_row(m, time.as_ref(), grouped, cx));
             if let Some(t) = time {
                 prev = Some((m, t));
@@ -3445,17 +4637,39 @@ impl DiscordApp {
         rows
     }
 
-    fn day_divider(t: &DateTime<Local>) -> AnyElement {
-        let line = || div().flex_1().h(px(1.)).bg(rgb(color::divider()));
+    /// Red "NOUVEAUX" line before the first unread message.
+    fn new_divider() -> AnyElement {
         div()
             .mx_4()
             .my_2()
             .flex()
             .items_center()
+            .child(div().flex_1().h(px(1.)).bg(rgb(color::red())))
+            .child(
+                div()
+                    .px_1()
+                    .rounded(px(4.))
+                    .bg(rgb(color::red()))
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xffffff))
+                    .child("NOUVEAUX"),
+            )
+            .into_any_element()
+    }
+
+    fn day_divider(t: &DateTime<Local>, new: bool) -> AnyElement {
+        let line_color = if new { color::red() } else { color::divider() };
+        let line = move || div().flex_1().h(px(1.)).bg(rgb(line_color));
+        div()
+            .mx_4()
+            .my_3()
+            .flex()
+            .items_center()
             .gap_2()
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(color::muted()))
+            .text_color(rgb(if new { color::red() } else { color::muted() }))
             .child(line())
             .child(format!(
                 "{} {} {}",
@@ -3464,6 +4678,18 @@ impl DiscordApp {
                 t.year()
             ))
             .child(line())
+            .when(new, |d| {
+                d.child(
+                    div()
+                        .px_1()
+                        .rounded(px(4.))
+                        .bg(rgb(color::red()))
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xffffff))
+                        .child("NOUVEAUX"),
+                )
+            })
             .into_any_element()
     }
 
@@ -3637,46 +4863,54 @@ impl DiscordApp {
             .border_t_2()
             .border_color(rgb(color::divider()))
             .rounded_tl(px(6.));
-        let body: AnyElement = match &m.referenced_message {
-            Some(r) => {
-                let author = r.author.clone();
-                let tint = self.name_color(&r.author.id).unwrap_or_else(color::muted);
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .flex_1()
-                    .child(self.avatar(&r.author, 16.))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("rp-{}", m.id)))
-                            .flex_shrink_0()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(tint))
-                            .cursor_pointer()
-                            .hover(|d| d.underline())
-                            .child(format!("@{}", r.author.display_name()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_profile(author.clone(), cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(self.preview_text(r)),
-                    )
-                    .into_any_element()
-            }
-            None => div()
-                .italic()
-                .child("Le message d'origine a été supprimé.")
-                .into_any_element(),
-        };
+        let body: AnyElement =
+            match &m.referenced_message {
+                Some(r) => {
+                    let author = r.author.clone();
+                    let tint = self.name_color(&r.author.id).unwrap_or_else(color::muted);
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .flex_1()
+                        .child(self.avatar(&r.author, 16.))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("rp-{}", m.id)))
+                                .flex_shrink_0()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(tint))
+                                .cursor_pointer()
+                                .hover(|d| d.underline())
+                                .child(format!("@{}", r.author.display_name()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_profile(author.clone(), cx)
+                                })),
+                        )
+                        .child({
+                            let target = r.id.clone();
+                            div()
+                                .id(SharedString::from(format!("rpj-{}", m.id)))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(rgb(color::bright())))
+                                .child(self.preview_text(r))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.jump_to_message(&target, cx)
+                                }))
+                        })
+                        .into_any_element()
+                }
+                None => div()
+                    .italic()
+                    .child("Le message d'origine a été supprimé.")
+                    .into_any_element(),
+            };
         Some(
             div()
                 .ml(px(20.))
@@ -3907,21 +5141,10 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    /// Hover toolbar: reply, and edit/delete on our own messages.
+    /// Hover toolbar: react, reply, thread, copy, and edit/delete on our own messages.
     fn toolbar(&self, m: &Message, group: SharedString, cx: &mut Context<Self>) -> AnyElement {
         let mine = self.me.as_ref().is_some_and(|u| u.id == m.author.id);
         let armed = self.confirm_delete.as_deref() == Some(&m.id);
-        let btn = |id: String, label: &str, danger: bool| {
-            div()
-                .id(SharedString::from(id))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .cursor_pointer()
-                .text_color(rgb(if danger { color::red() } else { color::muted() }))
-                .hover(|d| d.bg(rgb(color::hover())))
-                .child(label.to_string())
-        };
         let (reply, edit, del, react, thread) =
             (m.clone(), m.clone(), m.clone(), m.clone(), m.clone());
         let can_thread = m.thread.is_none()
@@ -3930,38 +5153,65 @@ impl DiscordApp {
                 .as_ref()
                 .is_some_and(|c| !c.is_dm() && !c.is_thread());
         let copy = m.content.clone();
+        let small = |id: String, name: &str, label: &str| {
+            let g: SharedString = format!("tb-{id}").into();
+            div()
+                .id(SharedString::from(id))
+                .group(g.clone())
+                .size(px(30.))
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(color::hover())))
+                .child(
+                    icon(name, 18., color::muted())
+                        .group_hover(g, |s| s.text_color(rgb(color::bright()))),
+                )
+                .tooltip(tip(label.to_string()))
+        };
         div()
             .absolute()
-            .top(px(-14.))
+            .top(px(-16.))
             .right(px(16.))
+            .p(px(2.))
             .flex()
-            .rounded(px(4.))
+            .rounded(px(8.))
             .border_1()
-            .border_color(rgb(color::rail()))
-            .bg(rgb(color::chat()))
+            .border_color(rgb(color::border()))
+            .bg(rgb(color::panel()))
+            .shadow_md()
             .opacity(0.)
             .group_hover(group, |s| s.opacity(1.))
             .child(
-                btn(format!("react-{}", m.id), "Réagir", false).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.picker = Some(Picker::React(react.clone()));
-                        cx.notify();
-                    },
-                )),
+                small(
+                    format!("react-{}", m.id),
+                    "smile-plus",
+                    "Ajouter une réaction",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.picker_tab = PickerTab::Emoji;
+                    this.picker = Some(Picker::React(react.clone()));
+                    cx.notify();
+                })),
             )
             .child(
-                btn(format!("reply-{}", m.id), "Répondre", false)
+                small(format!("reply-{}", m.id), "reply", "Répondre")
                     .on_click(cx.listener(move |this, _, _, cx| this.start_reply(&reply, cx))),
             )
             .when(can_thread, |d| {
                 d.child(
-                    btn(format!("thread-{}", m.id), "Fil", false).on_click(
-                        cx.listener(move |this, _, _, cx| this.start_thread(&thread, cx)),
-                    ),
+                    small(
+                        format!("thread-{}", m.id),
+                        "message-square-text",
+                        "Créer un fil",
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.start_thread(&thread, cx))),
                 )
             })
             .child(
-                btn(format!("copy-{}", m.id), "Copier", false).on_click(cx.listener(
+                small(format!("copy-{}", m.id), "copy", "Copier le texte").on_click(cx.listener(
                     move |_, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
                     },
@@ -3969,15 +5219,20 @@ impl DiscordApp {
             )
             .when(mine, |d| {
                 d.child(
-                    btn(format!("edit-{}", m.id), "Modifier", false)
+                    small(format!("edit-{}", m.id), "pencil", "Modifier")
                         .on_click(cx.listener(move |this, _, _, cx| this.start_edit(&edit, cx))),
                 )
                 .child(
-                    btn(
+                    small(
                         format!("del-{}", m.id),
-                        if armed { "Confirmer ?" } else { "Supprimer" },
-                        true,
+                        "trash",
+                        if armed {
+                            "Cliquez à nouveau pour supprimer"
+                        } else {
+                            "Supprimer"
+                        },
                     )
+                    .when(armed, |d| d.bg(rgba((color::red() << 8) | 0x33)))
                     .on_click(cx.listener(move |this, _, _, cx| this.delete_message(&del, cx))),
                 )
             })
@@ -4127,17 +5382,27 @@ impl DiscordApp {
                 .me
                 .as_ref()
                 .is_some_and(|me| m.mentions.iter().any(|u| u.id == me.id));
+        let (gap, pad) = match self.density.as_str() {
+            "compact" => (6., 1.),
+            "spacious" => (22., 4.),
+            _ => (16., 2.),
+        };
+        let flashing = self
+            .flash
+            .as_ref()
+            .is_some_and(|(id, t)| *id == m.id && t.elapsed().as_secs_f32() < 2.5);
         let mut row = div()
             .group(group.clone())
             .relative()
             .when(pinged, |d| {
                 d.bg(rgb(color::ping_bg()))
                     .border_l_2()
-                    .border_color(rgb(0xf0b232))
+                    .border_color(rgb(color::yellow()))
             })
+            .when(flashing, |d| d.bg(rgba(0x5865f22e)))
             .px_4()
-            .py(px(2.))
-            .when(!grouped, |d| d.mt(px(14.)))
+            .py(px(pad))
+            .when(!grouped, |d| d.mt(px(gap)))
             .hover(|d| d.bg(rgb(color::msg_hover())))
             .flex()
             .flex_col();

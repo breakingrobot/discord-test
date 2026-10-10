@@ -1,4 +1,5 @@
 mod api;
+mod assets;
 mod emoji;
 mod gateway;
 mod notify;
@@ -25,6 +26,10 @@ use api::{Channel, Emoji, Guild, GuildEmoji, Message, User};
 const POLL_FAST: Duration = Duration::from_secs(4);
 const TYPING_TTL: Duration = Duration::from_secs(8);
 const MAX_INFLIGHT_IMAGES: usize = 16;
+/// Decoded images kept around beyond what is on screen.
+const MAX_CACHED_IMAGES: usize = 200;
+/// Older history kept in memory per channel.
+const MAX_MESSAGES: usize = 600;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -52,6 +57,8 @@ pub enum QrState {
 pub struct Unread {
     pub guild: Option<String>,
     pub mentions: u32,
+    /// First message received while away (for the "new messages" divider).
+    pub first_id: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +137,19 @@ pub struct DiscordApp {
     member_roles: HashMap<String, Vec<String>>,
     presence: HashMap<String, String>,
     session_id: Option<String>,
+    inbox_open: bool,
+    inbox: Vec<Message>,
+    inbox_loading: bool,
+    status_menu: bool,
+    my_status: String,
+    settings_tab: u8,
+    /// Divider "Nouveaux messages" goes before this message id.
+    new_since: Option<String>,
+    jump_to: Option<String>,
+    flash: Option<(String, Instant)>,
+    friends_all: bool,
+    /// Channel to open once the guild's channels are loaded.
+    pending_channel: Option<String>,
     all_roles: HashMap<String, HashMap<String, api::Role>>,
     users: HashMap<String, User>,
     profile_data: Option<api::Profile>,
@@ -159,7 +179,11 @@ pub struct DiscordApp {
     profile: Option<User>,
     settings: bool,
     title_badge: bool,
-    light: bool,
+    theme: ui::color::Theme,
+    /// "compact" | "default" | "spacious".
+    density: String,
+    sidebar_width: f32,
+    resizing: bool,
     notifications: bool,
     last_title: String,
     gateway_cmd: Option<flume::Sender<gateway::Command>>,
@@ -229,7 +253,8 @@ fn detect_format(b: &[u8]) -> Option<ImageFormat> {
 impl DiscordApp {
     fn new(cx: &mut Context<Self>) -> Self {
         let prefs = prefs::load();
-        ui::color::set_light(prefs.light);
+        let theme = ui::color::Theme::from_key(&prefs.theme);
+        ui::color::set_theme(theme);
         let mut this = Self {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
@@ -260,6 +285,17 @@ impl DiscordApp {
             member_roles: HashMap::new(),
             presence: HashMap::new(),
             session_id: None,
+            inbox_open: false,
+            inbox: vec![],
+            inbox_loading: false,
+            status_menu: false,
+            my_status: "online".into(),
+            settings_tab: 0,
+            new_since: None,
+            jump_to: None,
+            flash: None,
+            friends_all: false,
+            pending_channel: None,
             all_roles: HashMap::new(),
             users: HashMap::new(),
             profile_data: None,
@@ -288,7 +324,10 @@ impl DiscordApp {
             profile: None,
             settings: false,
             title_badge: prefs.title_badge,
-            light: prefs.light,
+            theme,
+            density: prefs.density.clone(),
+            sidebar_width: prefs.sidebar_width.clamp(180., 420.),
+            resizing: false,
             notifications: prefs.notifications,
             last_title: String::new(),
             gateway_cmd: None,
@@ -481,16 +520,25 @@ impl DiscordApp {
 
     pub fn save_prefs(&self) {
         prefs::save(&prefs::Prefs {
-            light: self.light,
+            theme: self.theme.key().into(),
+            density: self.density.clone(),
+            sidebar_width: self.sidebar_width,
+            light: false,
             notifications: self.notifications,
             title_badge: self.title_badge,
             show_side: self.show_side,
         });
     }
 
-    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.light = !self.light;
-        ui::color::set_light(self.light);
+    pub fn set_theme(&mut self, theme: ui::color::Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        ui::color::set_theme(theme);
+        self.save_prefs();
+        cx.notify();
+    }
+
+    pub fn set_density(&mut self, density: &str, cx: &mut Context<Self>) {
+        self.density = density.to_string();
         self.save_prefs();
         cx.notify();
     }
@@ -1218,6 +1266,74 @@ impl DiscordApp {
         cx.notify();
     }
 
+    pub fn toggle_inbox(&mut self, cx: &mut Context<Self>) {
+        self.inbox_open = !self.inbox_open;
+        self.status_menu = false;
+        if self.inbox_open && !self.auth.starts_with("Bot ") {
+            self.inbox_loading = true;
+            let auth = self.auth.clone();
+            cx.spawn(async move |this, cx| {
+                let res = cx
+                    .background_spawn(async move { api::mentions(&auth) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.inbox_loading = false;
+                    match res {
+                        Ok(m) => {
+                            this.learn_users(&m);
+                            this.inbox = m;
+                        }
+                        Err(e) => this.status = format!("Mentions indisponibles : {e}"),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Opens the channel of a message (possibly in another guild) and jumps to it.
+    pub fn open_message(&mut self, m: &Message, cx: &mut Context<Self>) {
+        self.inbox_open = false;
+        self.jump_to = Some(m.id.clone());
+        match &m.guild_id {
+            Some(g) if self.guild.as_deref() != Some(g.as_str()) => {
+                self.pending_channel = Some(m.channel_id.clone());
+                self.select_guild(g.clone(), cx);
+            }
+            Some(_) => self.open_channel_id(&m.channel_id.clone(), cx),
+            None => {
+                self.guild = None;
+                self.channels.clear();
+                self.open_channel_id(&m.channel_id.clone(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_status(&mut self, status: &str, cx: &mut Context<Self>) {
+        self.my_status = status.to_string();
+        self.status_menu = false;
+        if let Some(tx) = &self.gateway_cmd {
+            let _ = tx.send(gateway::Command::SetStatus(status.to_string()));
+        }
+        cx.notify();
+    }
+
+    /// Scrolls to a loaded message (reply previews) and flashes it.
+    pub fn jump_to_message(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.messages.iter().any(|m| m.id == id) {
+            self.jump_to = Some(id.to_string());
+        } else {
+            self.status =
+                "Ce message n'est pas chargé : utilisez « Charger les messages précédents »."
+                    .into();
+        }
+        cx.notify();
+    }
+
     pub fn open_channel_id(&mut self, id: &str, cx: &mut Context<Self>) {
         let found = self
             .channels
@@ -1589,6 +1705,10 @@ impl DiscordApp {
                 }
                 match res {
                     Ok(mut older) => {
+                        if this.messages.len() + older.len() > MAX_MESSAGES {
+                            this.status = "Limite d'historique en mémoire atteinte.".into();
+                            this.history_done = true;
+                        }
                         this.history_done = older.len() < 50;
                         this.learn_users(&older);
                         older.append(&mut this.messages);
@@ -1813,6 +1933,7 @@ impl DiscordApp {
                         .or_insert_with(|| Unread {
                             guild: m.guild_id.clone(),
                             mentions: 0,
+                            first_id: Some(m.id.clone()),
                         });
                     if pinged {
                         e.mentions += 1;
@@ -1954,6 +2075,17 @@ impl DiscordApp {
         self.channels.clear();
         self.members.clear();
         self.threads.clear();
+        self.forum_archived.clear();
+        self.search_results.clear();
+        self.pins.clear();
+        if self.commands.len() > 16 {
+            self.commands.clear();
+        }
+        if self.users.len() > 5000 {
+            self.users.clear();
+            self.known_users.clear();
+        }
+        self.messages.shrink_to_fit();
         self.roles = self.all_roles.get(&id).cloned().unwrap_or_default();
         self.member_roles.clear();
         if self.roles.is_empty() {
@@ -1991,7 +2123,13 @@ impl DiscordApp {
                     Ok(c) => {
                         this.channels = c;
                         this.refresh_threads(cx);
-                        if let Some(first) = this
+                        let pending = this
+                            .pending_channel
+                            .take()
+                            .and_then(|id| this.channels.iter().find(|c| c.id == id).cloned());
+                        if let Some(c) = pending {
+                            this.select_channel(c, cx);
+                        } else if let Some(first) = this
                             .channels
                             .iter()
                             .find(|c| !c.is_forum() && c.kind != 4)
@@ -2012,7 +2150,7 @@ impl DiscordApp {
 
     fn select_channel(&mut self, channel: Channel, cx: &mut Context<Self>) {
         self.reset_channel();
-        self.unread.remove(&channel.id);
+        self.new_since = self.unread.remove(&channel.id).and_then(|u| u.first_id);
         self.nav_open = false;
         self.channel = Some(channel);
         self.status.clear();
@@ -2164,6 +2302,25 @@ impl DiscordApp {
             }
             wanted.extend(m.reactions.iter().filter_map(|r| r.emoji.url()));
         }
+        // Memory: past the cap, drop decoded images the current view doesn't use
+        // (they are re-downloaded on demand) and release GPUI's decoded copy too.
+        if self.images.len() > MAX_CACHED_IMAGES {
+            let keep: HashSet<&String> = wanted.iter().collect();
+            let stale: Vec<String> = self
+                .images
+                .keys()
+                .filter(|k| !keep.contains(k))
+                .cloned()
+                .collect();
+            for k in stale {
+                if let Some(img) = self.images.remove(&k) {
+                    gpui::ImageSource::Image(img).remove_asset(cx);
+                }
+            }
+        }
+        if self.image_failed.len() > 2000 {
+            self.image_failed.clear();
+        }
         for url in wanted {
             if self.image_pending.len() >= MAX_INFLIGHT_IMAGES {
                 break;
@@ -2261,17 +2418,20 @@ impl Render for DiscordApp {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.), px(780.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(360.), px(480.))),
-                ..Default::default()
-            },
-            |_, cx| cx.new(DiscordApp::new),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(|cx: &mut App| {
+            let _ = cx.text_system().add_fonts(assets::fonts());
+            let bounds = Bounds::centered(None, size(px(1280.), px(780.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(360.), px(480.))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(DiscordApp::new),
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }

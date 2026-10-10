@@ -1,24 +1,34 @@
-//! Small persisted UI preferences (theme, notifications…) in the user's config dir.
+//! Small persisted UI preferences (theme, density, notifications…) in the user's config dir.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Prefs {
-    pub light: bool,
+    /// "light" | "ash" | "dark" | "onyx".
+    pub theme: String,
+    /// "compact" | "default" | "spacious".
+    pub density: String,
+    pub sidebar_width: f32,
     pub notifications: bool,
     pub title_badge: bool,
     pub show_side: bool,
+    /// Legacy field from earlier versions (light theme toggle).
+    pub light: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            light: false,
+            theme: "dark".into(),
+            density: "default".into(),
+            sidebar_width: 240.,
             notifications: true,
             title_badge: true,
             show_side: true,
+            light: false,
         }
     }
 }
@@ -32,10 +42,15 @@ fn path() -> Option<PathBuf> {
 }
 
 pub fn load() -> Prefs {
-    path()
+    let mut p: Prefs = path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if p.light {
+        p.theme = "light".into();
+        p.light = false;
+    }
+    p
 }
 
 pub fn save(prefs: &Prefs) {

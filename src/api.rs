@@ -91,7 +91,7 @@ impl Guild {
     pub fn icon_url(&self) -> Option<String> {
         self.icon.as_ref().map(|h| {
             format!(
-                "https://cdn.discordapp.com/icons/{}/{h}.png?size=96",
+                "https://cdn.discordapp.com/icons/{}/{h}.png?size=80",
                 self.id
             )
         })
@@ -1122,4 +1122,12 @@ pub fn profile(token: &str, user_id: &str, guild: Option<&str>) -> Result<Profil
             .collect(),
         user,
     })
+}
+
+/// Recent messages that mention us (the "Inbox").
+pub fn mentions(token: &str) -> Result<Vec<Message>, String> {
+    get(
+        token,
+        "/users/@me/mentions?limit=25&roles=true&everyone=true",
+    )
 }
