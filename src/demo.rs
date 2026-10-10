@@ -44,6 +44,7 @@ pub fn data() -> Demo {
         { "id": "300000000000000003", "name": "général", "type": 0, "position": 2, "parent_id": "300000000000000001",
           "topic": "Discussions générales autour de Rust et de GPUI" },
         { "id": "300000000000000004", "name": "aide", "type": 0, "position": 3, "parent_id": "300000000000000001" },
+        { "id": "300000000000000008", "name": "Salon vocal", "type": 2, "position": 4, "parent_id": "300000000000000001" },
         { "id": "300000000000000005", "name": "projets", "type": 4, "position": 4 },
         { "id": "300000000000000006", "name": "showcase", "type": 15, "position": 5, "parent_id": "300000000000000005" },
         { "id": "300000000000000007", "name": "client-discord", "type": 0, "position": 6, "parent_id": "300000000000000005" },

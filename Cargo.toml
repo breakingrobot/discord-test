@@ -21,6 +21,13 @@ qrcode = { version = "0.14", default-features = false }
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 anyhow = "1"
 rust-embed = "8"
+davey = "0.1"
+log = "0.4"
+audiopus = "0.3.0-rc.0"
+cpal = "0.15"
+nnnoiseless = { version = "0.5", default-features = false }
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 env_logger = { version = "0.11", default-features = false }
 
 

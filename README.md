@@ -43,7 +43,11 @@ A minimal Discord client in Rust using [GPUI](https://crates.io/crates/gpui).
 - Responsive layout (side panel becomes an overlay under 1050 px; under 760 px the sidebar slides over the chat via ☰),
   skeleton placeholders while avatars / images / messages / channels load, a "jump to latest" button, and clear
   messages for missing permissions (HTTP 403: locked channel view, disabled composer).
-- Not implemented: voice, private threads, desktop notification sounds, sub-commands, GIF favourites.
+- **Voice chat** (voice channels and DM calls): voice gateway v8, DAVE end-to-end encryption (via `davey`,
+  required by Discord since March 2026), AEAD transport encryption (AES-256-GCM / XChaCha20-Poly1305), Opus,
+  microphone / speaker through cpal, **RNNoise noise suppression** (`nnnoiseless`) with voice-activity gating,
+  mute / deafen, device selection, speaking indicators, end-to-end privacy code. Untested against Discord here.
+- Not implemented: video / screen share, private threads, desktop notification sounds, sub-commands, GIF favourites.
   Several of these features (member list, presence, slash commands, GIF search, QR login) rely on
   undocumented endpoints reproduced from community docs and are untested here.
 - Using a user account with a third-party client is against Discord's Terms of Service (account risk is yours).
@@ -56,7 +60,7 @@ screen directly, e.g. `settings:1`, `profile`, `friends,status`, `theme:light,in
 DISCORD_TOKEN=... cargo run --release
 ```
 
-Requires GPUI's Linux system deps (wayland/xcb, vulkan, fontconfig, etc.).
+Requires GPUI's Linux system deps (wayland/xcb, vulkan, fontconfig, etc.) and ALSA (`libasound2-dev`) plus CMake for Opus.
 `Cargo.lock` pins `libc` to 0.2.189 because `xattr` 0.2.3 (via gpui) fails with 0.2.190.
 
 

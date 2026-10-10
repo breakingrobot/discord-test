@@ -131,6 +131,10 @@ impl Channel {
     }
 
     /// Forum / media channels list posts (threads) instead of messages.
+    pub fn is_voice(&self) -> bool {
+        matches!(self.kind, 2 | 13)
+    }
+
     pub fn is_forum(&self) -> bool {
         matches!(self.kind, 15 | 16)
     }
@@ -546,7 +550,7 @@ pub fn guilds(token: &str) -> Result<Vec<Guild>, String> {
 /// Text/announcement channels and categories, in Discord's display order.
 pub fn channels(token: &str, guild: &str) -> Result<Vec<Channel>, String> {
     let mut chans: Vec<Channel> = get(token, &format!("/guilds/{guild}/channels"))?;
-    chans.retain(|c| matches!(c.kind, 0 | 4 | 5 | 15 | 16));
+    chans.retain(|c| matches!(c.kind, 0 | 2 | 4 | 5 | 13 | 15 | 16));
     chans.sort_by_key(|c| c.position);
     Ok(chans)
 }

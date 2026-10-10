@@ -29,6 +29,13 @@ pub enum Command {
     },
     /// "online" | "idle" | "dnd" | "invisible".
     SetStatus(String),
+    /// Join (`channel_id = Some`) or leave a voice channel / call.
+    VoiceState {
+        guild_id: Option<String>,
+        channel_id: Option<String>,
+        mute: bool,
+        deaf: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +63,22 @@ pub enum Event {
     },
     /// Roles per guild, taken from READY (avoids a REST call per guild).
     Roles(Vec<(String, Vec<(String, Role)>)>),
+    /// Someone's voice state changed (`channel_id = None` means they left).
+    VoiceStateUpdate {
+        guild_id: Option<String>,
+        channel_id: Option<String>,
+        user_id: String,
+        session_id: String,
+        user: Option<User>,
+        mute: bool,
+    },
+    /// Voice server for our pending connection.
+    VoiceServer {
+        token: String,
+        endpoint: Option<String>,
+    },
+    /// Voice states present at startup: (guild, channel, user).
+    VoiceStates(Vec<(String, String, String)>),
     /// Our session id (needed to run slash commands).
     Session(String),
     /// Initial presences of friends: (user id, status).
@@ -221,6 +244,20 @@ fn run(
                     guild_id,
                     channel_id,
                 } => (guild_id, channel_id),
+                Command::VoiceState {
+                    guild_id,
+                    channel_id,
+                    mute,
+                    deaf,
+                } => {
+                    let msg = json!({ "op": 4, "d": {
+                        "guild_id": guild_id, "channel_id": channel_id,
+                        "self_mute": mute, "self_deaf": deaf, "self_video": false,
+                    }});
+                    ws.send(Ws::text(msg.to_string()))
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 Command::SetStatus(status) => {
                     let msg = json!({ "op": 3, "d": {
                         "status": status, "since": 0, "activities": [], "afk": false,
@@ -288,6 +325,7 @@ fn run(
                     }
                     let _ = tx.send(Event::Presences(ready_presences(&v["d"])));
                     let _ = tx.send(Event::Roles(ready_roles(&v["d"])));
+                    let _ = tx.send(Event::VoiceStates(ready_voice_states(&v["d"])));
                 } else if kind == "RESUMED" && tx.send(Event::Connected(true)).is_err() {
                     return Ok(());
                 }
@@ -328,6 +366,20 @@ fn ready_roles(d: &Value) -> Vec<(String, Vec<(String, Role)>)> {
             Some((id, roles))
         })
         .collect()
+}
+
+/// Voice states carried by READY's `guilds` (user accounts).
+fn ready_voice_states(d: &Value) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for g in d["guilds"].as_array().into_iter().flatten() {
+        let gid = g["id"].as_str().unwrap_or_default();
+        for vs in g["voice_states"].as_array().into_iter().flatten() {
+            if let (Some(c), Some(u)) = (vs["channel_id"].as_str(), vs["user_id"].as_str()) {
+                out.push((gid.to_string(), c.to_string(), u.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// Friend presences from READY (shape differs between gateway versions).
@@ -404,6 +456,18 @@ fn dispatch(kind: &str, d: &Value) -> Option<Event> {
                 Event::MembersStale { guild_id }
             })
         }
+        "VOICE_STATE_UPDATE" => Some(Event::VoiceStateUpdate {
+            guild_id: d["guild_id"].as_str().map(str::to_string),
+            channel_id: d["channel_id"].as_str().map(str::to_string),
+            user_id: s("user_id"),
+            session_id: s("session_id"),
+            user: serde_json::from_value(d["member"]["user"].clone()).ok(),
+            mute: d["self_mute"].as_bool().unwrap_or(false) || d["mute"].as_bool().unwrap_or(false),
+        }),
+        "VOICE_SERVER_UPDATE" => Some(Event::VoiceServer {
+            token: s("token"),
+            endpoint: d["endpoint"].as_str().map(str::to_string),
+        }),
         "PRESENCE_UPDATE" => Some(Event::Presence {
             user_id: d["user"]["id"].as_str().unwrap_or_default().to_string(),
             status: s("status"),

@@ -15,6 +15,9 @@ pub struct Prefs {
     pub notifications: bool,
     pub title_badge: bool,
     pub show_side: bool,
+    pub noise_suppression: bool,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
     /// Legacy field from earlier versions (light theme toggle).
     pub light: bool,
 }
@@ -28,6 +31,9 @@ impl Default for Prefs {
             notifications: true,
             title_badge: true,
             show_side: true,
+            noise_suppression: true,
+            input_device: None,
+            output_device: None,
             light: false,
         }
     }

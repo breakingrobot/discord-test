@@ -8,6 +8,7 @@ mod prefs;
 mod qr;
 mod store;
 mod ui;
+mod voice;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -138,6 +139,19 @@ pub struct DiscordApp {
     member_roles: HashMap<String, Vec<String>>,
     presence: HashMap<String, String>,
     session_id: Option<String>,
+    // voice
+    voice: Option<voice::VoiceHandle>,
+    voice_settings: voice::VoiceSettings,
+    voice_target: Option<(Option<String>, String)>,
+    voice_session: Option<String>,
+    voice_server: Option<(String, String)>,
+    voice_connected: bool,
+    voice_status: String,
+    voice_privacy: Option<String>,
+    /// user id -> (guild id, channel id, self-muted)
+    voice_states: HashMap<String, (Option<String>, String, bool)>,
+    speaking: HashSet<String>,
+    audio_devices: Option<(Vec<String>, Vec<String>)>,
     inbox_open: bool,
     inbox: Vec<Message>,
     inbox_loading: bool,
@@ -286,6 +300,26 @@ impl DiscordApp {
             member_roles: HashMap::new(),
             presence: HashMap::new(),
             session_id: None,
+            voice: None,
+            voice_settings: {
+                let v = voice::VoiceSettings {
+                    input_device: prefs.input_device.clone(),
+                    output_device: prefs.output_device.clone(),
+                    ..Default::default()
+                };
+                v.noise_suppression
+                    .store(prefs.noise_suppression, Ordering::Relaxed);
+                v
+            },
+            voice_target: None,
+            voice_session: None,
+            voice_server: None,
+            voice_connected: false,
+            voice_status: String::new(),
+            voice_privacy: None,
+            voice_states: HashMap::new(),
+            speaking: HashSet::new(),
+            audio_devices: None,
             inbox_open: false,
             inbox: vec![],
             inbox_loading: false,
@@ -528,6 +562,12 @@ impl DiscordApp {
             theme: self.theme.key().into(),
             density: self.density.clone(),
             sidebar_width: self.sidebar_width,
+            noise_suppression: self
+                .voice_settings
+                .noise_suppression
+                .load(Ordering::Relaxed),
+            input_device: self.voice_settings.input_device.clone(),
+            output_device: self.voice_settings.output_device.clone(),
             light: false,
             notifications: self.notifications,
             title_badge: self.title_badge,
@@ -617,6 +657,22 @@ impl DiscordApp {
                 "switcher" => self.switcher = Some("g".into()),
                 "reply" => self.replying = self.messages.get(1).cloned(),
                 "density" => self.density = v.to_string(),
+                "voice" => {
+                    let g = self.guild.clone();
+                    for (u, m) in [
+                        ("100000000000000001", false),
+                        ("100000000000000002", false),
+                        ("100000000000000003", true),
+                    ] {
+                        self.voice_states
+                            .insert(u.into(), (g.clone(), "300000000000000008".into(), m));
+                    }
+                    self.speaking.insert("100000000000000002".into());
+                    self.voice_target = Some((g, "300000000000000008".into()));
+                    self.voice_connected = true;
+                    self.voice_status = "Voix connectée".into();
+                    self.voice_privacy = Some("12345 67890 13579".into());
+                }
                 _ => {}
             }
         }
@@ -1413,6 +1469,187 @@ impl DiscordApp {
         cx.notify();
     }
 
+    // ---- voice -----------------------------------------------------------------
+
+    /// Joins a voice channel (guild) or call (DM: `guild = None`).
+    pub fn join_voice(&mut self, guild: Option<String>, channel: String, cx: &mut Context<Self>) {
+        if self
+            .voice_target
+            .as_ref()
+            .is_some_and(|(_, c)| *c == channel)
+        {
+            return;
+        }
+        if self.auth.starts_with("Bot ") || self.gateway_cmd.is_none() {
+            self.status = "Le vocal nécessite une connexion au Gateway.".into();
+            return cx.notify();
+        }
+        self.voice = None;
+        self.voice_server = None;
+        self.voice_session = None;
+        self.voice_connected = false;
+        self.voice_privacy = None;
+        self.speaking.clear();
+        self.voice_target = Some((guild.clone(), channel.clone()));
+        self.voice_status = "Connexion…".into();
+        if let Some(tx) = &self.gateway_cmd {
+            let _ = tx.send(gateway::Command::VoiceState {
+                guild_id: guild,
+                channel_id: Some(channel),
+                mute: self.voice_settings.muted.load(Ordering::Relaxed),
+                deaf: self.voice_settings.deafened.load(Ordering::Relaxed),
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn leave_voice(&mut self, cx: &mut Context<Self>) {
+        let Some((guild, _)) = self.voice_target.take() else {
+            return;
+        };
+        self.voice = None;
+        self.voice_connected = false;
+        self.voice_privacy = None;
+        self.speaking.clear();
+        self.voice_status.clear();
+        if let Some(tx) = &self.gateway_cmd {
+            let _ = tx.send(gateway::Command::VoiceState {
+                guild_id: guild,
+                channel_id: None,
+                mute: false,
+                deaf: false,
+            });
+        }
+        cx.notify();
+    }
+
+    fn send_voice_flags(&self) {
+        if let (Some((guild, channel)), Some(tx)) = (&self.voice_target, &self.gateway_cmd) {
+            let _ = tx.send(gateway::Command::VoiceState {
+                guild_id: guild.clone(),
+                channel_id: Some(channel.clone()),
+                mute: self.voice_settings.muted.load(Ordering::Relaxed),
+                deaf: self.voice_settings.deafened.load(Ordering::Relaxed),
+            });
+        }
+    }
+
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        let m = &self.voice_settings.muted;
+        m.store(!m.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.send_voice_flags();
+        cx.notify();
+    }
+
+    pub fn toggle_deafen(&mut self, cx: &mut Context<Self>) {
+        let d = &self.voice_settings.deafened;
+        let now = !d.load(Ordering::Relaxed);
+        d.store(now, Ordering::Relaxed);
+        // Deafening also mutes, like Discord.
+        if now {
+            self.voice_settings.muted.store(true, Ordering::Relaxed);
+        }
+        self.send_voice_flags();
+        cx.notify();
+    }
+
+    pub fn toggle_noise_suppression(&mut self, cx: &mut Context<Self>) {
+        let n = &self.voice_settings.noise_suppression;
+        n.store(!n.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.save_prefs();
+        cx.notify();
+    }
+
+    /// Starts the voice connection once both the session and the server are known.
+    fn try_start_voice(&mut self, cx: &mut Context<Self>) {
+        let (Some((guild, channel)), Some(session), Some((token, endpoint)), Some(me)) = (
+            self.voice_target.clone(),
+            self.voice_session.clone(),
+            self.voice_server.clone(),
+            self.me.clone(),
+        ) else {
+            return;
+        };
+        if self.voice.is_some() {
+            return;
+        }
+        let info = voice::ConnectInfo {
+            endpoint,
+            token,
+            session_id: session,
+            server_id: guild.unwrap_or_else(|| channel.clone()),
+            channel_id: channel,
+            user_id: me.id,
+        };
+        let (tx, rx) = flume::unbounded();
+        self.voice = Some(voice::connect(info, self.voice_settings.clone(), tx));
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = rx.recv_async().await {
+                if this.update(cx, |this, cx| this.on_voice(ev, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_voice(&mut self, ev: voice::VoiceEvent, cx: &mut Context<Self>) {
+        use voice::VoiceEvent::*;
+        match ev {
+            State(s) => self.voice_status = s,
+            Connected => {
+                self.voice_connected = true;
+                self.voice_status = "Voix connectée".into();
+            }
+            Speaking { user_id, speaking } => {
+                let id = if user_id.is_empty() {
+                    self.me.as_ref().map(|u| u.id.clone()).unwrap_or_default()
+                } else {
+                    user_id
+                };
+                if speaking {
+                    self.speaking.insert(id);
+                } else {
+                    self.speaking.remove(&id);
+                }
+            }
+            Privacy(code) => self.voice_privacy = code,
+            Closed(reason) => {
+                if self.voice_target.is_some() {
+                    self.voice_status = reason;
+                }
+                self.voice = None;
+                self.voice_connected = false;
+                self.speaking.clear();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Users currently in a voice channel.
+    pub fn voice_members(&self, channel: &str) -> Vec<User> {
+        let mut ids: Vec<&String> = self
+            .voice_states
+            .iter()
+            .filter(|(_, (_, c, _))| c == channel)
+            .map(|(u, _)| u)
+            .collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                self.users.get(id).cloned().unwrap_or_else(|| User {
+                    id: id.clone(),
+                    username: self
+                        .known_users
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| "…".into()),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
     pub fn open_channel_id(&mut self, id: &str, cx: &mut Context<Self>) {
         let found = self
             .channels
@@ -1874,6 +2111,7 @@ impl DiscordApp {
         self.cancel_compose();
         self.clear_input();
         self.status.clear();
+        self.leave_voice(cx);
         self.unread.clear();
         self.members.clear();
         self.gateway_cmd = None;
@@ -1947,6 +2185,53 @@ impl DiscordApp {
                 }
             }
             Session(id) => self.session_id = Some(id),
+            VoiceStates(list) => {
+                for (g, c, u) in list {
+                    self.voice_states.insert(u, (Some(g), c, false));
+                }
+            }
+            VoiceStateUpdate {
+                guild_id,
+                channel_id,
+                user_id,
+                session_id,
+                user,
+                mute,
+                ..
+            } => {
+                if let Some(u) = user {
+                    self.users.insert(u.id.clone(), u);
+                }
+                let mine = self.me.as_ref().is_some_and(|m| m.id == user_id);
+                match channel_id {
+                    Some(c) => {
+                        self.voice_states.insert(user_id, (guild_id, c, mute));
+                        if mine && self.voice_target.is_some() {
+                            self.voice_session = Some(session_id);
+                            self.try_start_voice(cx);
+                        }
+                    }
+                    None => {
+                        self.voice_states.remove(&user_id);
+                        if mine && self.voice_target.is_some() && self.voice_connected {
+                            // Kicked / moved out of the channel.
+                            self.voice_target = None;
+                            self.voice = None;
+                            self.voice_connected = false;
+                            self.voice_status = "Déconnecté du vocal".into();
+                        }
+                    }
+                }
+            }
+            VoiceServer {
+                token, endpoint, ..
+            } => {
+                if let (Some(ep), true) = (endpoint, self.voice_target.is_some()) {
+                    self.voice = None;
+                    self.voice_server = Some((token, ep));
+                    self.try_start_voice(cx);
+                }
+            }
             Presences(list) => self.presence.extend(list),
             Presence { user_id, status } => {
                 self.presence.insert(user_id, status);

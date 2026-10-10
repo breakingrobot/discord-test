@@ -15,6 +15,8 @@ use gpui::{
 use crate::api;
 use crate::api::{Channel, Message, User};
 use crate::gateway::MemberRow;
+use std::sync::atomic::Ordering;
+
 use crate::{DiscordApp, Field, LoginMode, Picker, PickerTab, QrState, Side};
 
 /// Theme palette (Discord 2025 refresh: Light, Ash, Dark, Onyx).
@@ -1161,6 +1163,7 @@ impl DiscordApp {
                     .left(px(8.))
                     .bottom(px(8.))
                     .w(px(72. + sw - 16.))
+                    .children(self.voice_panel(cx))
                     .child(self.user_panel(cx)),
             )
     }
@@ -1446,6 +1449,36 @@ impl DiscordApp {
                         cx.notify();
                     })),
             )
+            .child({
+                let muted = self.voice_settings.muted.load(Ordering::Relaxed);
+                icon_button(
+                    "mute-btn",
+                    if muted { "mic-off" } else { "mic" },
+                    if muted {
+                        "Réactiver le micro"
+                    } else {
+                        "Couper le micro"
+                    },
+                    false,
+                )
+                .when(muted, |d| d.bg(rgba((color::red() << 8) | 0x26)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx)))
+            })
+            .child({
+                let deaf = self.voice_settings.deafened.load(Ordering::Relaxed);
+                icon_button(
+                    "deaf-btn",
+                    if deaf { "headphone-off" } else { "headphones" },
+                    if deaf {
+                        "Réactiver le son"
+                    } else {
+                        "Mettre en sourdine"
+                    },
+                    false,
+                )
+                .when(deaf, |d| d.bg(rgba((color::red() << 8) | 0x26)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx)))
+            })
             .child(
                 icon_button("settings-btn", "settings", "Paramètres utilisateur", false).on_click(
                     cx.listener(|this, _, _, cx| {
@@ -2304,6 +2337,7 @@ impl DiscordApp {
         for c in loose {
             rows.push(self.channel_row(c, cx));
             rows.extend(self.thread_rows(&c.id, cx));
+            rows.extend(self.voice_rows(&c.id, cx));
         }
         for cat in categories {
             let collapsed = self.collapsed.contains(&cat.id);
@@ -2318,6 +2352,7 @@ impl DiscordApp {
             {
                 rows.push(self.channel_row(c, cx));
                 rows.extend(self.thread_rows(&c.id, cx));
+                rows.extend(self.voice_rows(&c.id, cx));
             }
         }
         rows
@@ -2450,12 +2485,184 @@ impl DiscordApp {
         list.into_any_element()
     }
 
+    /// People connected to a voice channel, listed under it in the sidebar.
+    fn voice_rows(&self, channel: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.voice_members(channel)
+            .into_iter()
+            .map(|u| {
+                let speaking = self.speaking.contains(&u.id);
+                let muted = self.voice_states.get(&u.id).is_some_and(|(_, _, m)| *m);
+                let prof = u.clone();
+                div()
+                    .id(SharedString::from(format!("vm-{channel}-{}", u.id)))
+                    .h(px(30.))
+                    .ml(px(28.))
+                    .px_2()
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(color::hover())))
+                    .child(
+                        div()
+                            .rounded_full()
+                            .border_2()
+                            .border_color(rgb(if speaking {
+                                color::green()
+                            } else {
+                                color::sidebar()
+                            }))
+                            .child(self.avatar(&u, 20.)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .text_color(rgb(if speaking {
+                                color::bright()
+                            } else {
+                                color::muted()
+                            }))
+                            .child(u.display_name().to_string()),
+                    )
+                    .when(muted, |d| d.child(icon("mic-off", 14., color::muted())))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_profile(prof.clone(), cx)),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Floating "voice connected" card above the user panel.
+    fn voice_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (guild, channel) = self.voice_target.clone()?;
+        let place = match &guild {
+            Some(g) => {
+                let ch = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == channel)
+                    .map(|c| c.title())
+                    .unwrap_or_else(|| "Salon vocal".into());
+                let gn = self
+                    .guilds
+                    .iter()
+                    .find(|x| &x.id == g)
+                    .map(|x| x.name.clone())
+                    .unwrap_or_default();
+                format!("{ch} / {gn}")
+            }
+            None => self
+                .dms
+                .iter()
+                .find(|c| c.id == channel)
+                .map(|c| format!("Appel · {}", c.title()))
+                .unwrap_or_else(|| "Appel".into()),
+        };
+        let ok = self.voice_connected;
+        let tint = if ok { color::green() } else { color::yellow() };
+        let ns = self
+            .voice_settings
+            .noise_suppression
+            .load(Ordering::Relaxed);
+        let privacy = self.voice_privacy.clone();
+        Some(
+            div()
+                .mb_2()
+                .px_3()
+                .py_2()
+                .rounded(px(10.))
+                .bg(rgb(color::panel()))
+                .border_1()
+                .border_color(rgb(color::border()))
+                .shadow_md()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(tint))
+                                .child(icon("signal", 14., tint))
+                                .child(self.voice_status.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(color::muted()))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(place),
+                        )
+                        .children(privacy.map(|code| {
+                            div()
+                                .id("voice-e2ee")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(rgb(color::green()))
+                                .child(icon("lock", 11., color::green()))
+                                .child("Chiffré de bout en bout")
+                                .tooltip(tip(format!("Code de confidentialité : {code}")))
+                        })),
+                )
+                .child(
+                    icon_button(
+                        "ns-btn",
+                        "audio-waveform",
+                        if ns {
+                            "Réduction de bruit : activée"
+                        } else {
+                            "Réduction de bruit : désactivée"
+                        },
+                        ns,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_noise_suppression(cx))),
+                )
+                .child(
+                    div()
+                        .id("leave-voice")
+                        .size(px(32.))
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba((color::red() << 8) | 0x33)))
+                        .child(icon("phone-off", 18., color::red()))
+                        .tooltip(tip("Se déconnecter"))
+                        .on_click(cx.listener(|this, _, _, cx| this.leave_voice(cx))),
+                ),
+        )
+    }
+
     fn channel_row(&self, c: &Channel, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.channel.as_ref().map(|s| &s.id) == Some(&c.id);
+        let active = self.channel.as_ref().map(|s| &s.id) == Some(&c.id)
+            || self.voice_target.as_ref().is_some_and(|(_, v)| *v == c.id);
         let chan = c.clone();
         let unread = self.unread.get(&c.id).cloned();
         let bright = active || unread.is_some();
         let glyph = match c.kind {
+            2 => "volume-2",
+            13 => "audio-waveform",
             5 => "megaphone",
             15 | 16 => "messages-square",
             _ => "hash",
@@ -2510,7 +2717,14 @@ impl DiscordApp {
                     .filter(|u| u.mentions > 0)
                     .map(|u| mention_pill(u.mentions)),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.select_channel(chan.clone(), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if chan.is_voice() {
+                    let guild = this.guild.clone();
+                    this.join_voice(guild, chan.id.clone(), cx)
+                } else {
+                    this.select_channel(chan.clone(), cx)
+                }
+            }))
             .into_any_element()
     }
 
@@ -4201,9 +4415,10 @@ impl DiscordApp {
 
     fn settings_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let me = self.me.clone().unwrap_or_default();
-        let tabs: [(&str, &str); 4] = [
+        let tabs: [(&str, &str); 5] = [
             ("user", "Mon compte"),
             ("palette", "Apparence"),
+            ("mic", "Voix et vidéo"),
             ("bell", "Notifications"),
             ("sliders-horizontal", "Avancé"),
         ];
@@ -4220,6 +4435,7 @@ impl DiscordApp {
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(
@@ -4370,7 +4586,115 @@ impl DiscordApp {
                     )
                     .into_any_element()
             }
-            2 => div()
+            2 => {
+                let ns = self.voice_settings.noise_suppression.load(Ordering::Relaxed);
+                let (ins, outs) = self.audio_devices.clone().unwrap_or_default();
+                let picker = |id: &'static str,
+                              title: &'static str,
+                              list: Vec<String>,
+                              current: Option<String>,
+                              input: bool,
+                              cx: &mut Context<Self>| {
+                    let mut col = div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Self::section_label(title.into()));
+                    let mut entries: Vec<Option<String>> = vec![None];
+                    entries.extend(list.into_iter().map(Some));
+                    for (i, dev) in entries.into_iter().enumerate() {
+                        let on = dev == current;
+                        let label = dev.clone().unwrap_or_else(|| "Par défaut du système".into());
+                        col = col.child(
+                            div()
+                                .id(SharedString::from(format!("{id}-{i}")))
+                                .h(px(34.))
+                                .px_3()
+                                .rounded(px(8.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(if on { color::bright() } else { color::muted() }))
+                                .when(on, |d| d.bg(rgb(color::active())))
+                                .hover(|d| d.bg(rgb(color::hover())))
+                                .child(icon(if on { "check" } else { "circle" }, 14., if on {
+                                    color::brand()
+                                } else {
+                                    color::muted()
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(label),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if input {
+                                        this.voice_settings.input_device = dev.clone();
+                                    } else {
+                                        this.voice_settings.output_device = dev.clone();
+                                    }
+                                    this.save_prefs();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    col
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(heading("Voix et vidéo"))
+                    .child(
+                        toggle(
+                            "set-ns",
+                            "Réduction de bruit (RNNoise)",
+                            "Supprime les bruits de fond (clavier, ventilateur…) et ne transmet que la voix.",
+                            ns,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_noise_suppression(cx))),
+                    )
+                    .child(picker(
+                        "in-dev",
+                        "PÉRIPHÉRIQUE D'ENTRÉE",
+                        ins,
+                        self.voice_settings.input_device.clone(),
+                        true,
+                        cx,
+                    ))
+                    .child(picker(
+                        "out-dev",
+                        "PÉRIPHÉRIQUE DE SORTIE",
+                        outs,
+                        self.voice_settings.output_device.clone(),
+                        false,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .mt_2()
+                            .p_3()
+                            .rounded(px(8.))
+                            .bg(rgb(color::frame()))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(rgb(color::muted()))
+                            .child(icon("shield-check", 16., color::green()))
+                            .child(div().flex_1().min_w_0().child(
+                                "Appels chiffrés de bout en bout (protocole DAVE). Les changements de périphérique s'appliquent au prochain appel.",
+                            )),
+                    )
+                    .into_any_element()
+            }
+            3 => div()
                 .flex()
                 .flex_col()
                 .child(heading("Notifications"))
@@ -4401,7 +4725,7 @@ impl DiscordApp {
                     })),
                 )
                 .into_any_element(),
-            3 => div()
+            4 => div()
                 .flex()
                 .flex_col()
                 .child(heading("Avancé"))
@@ -4562,6 +4886,9 @@ impl DiscordApp {
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_tab = i as u8;
+                        if i == 2 && this.audio_devices.is_none() {
+                            this.audio_devices = Some(crate::voice::devices());
+                        }
                         cx.notify();
                     }))
             }));
@@ -5500,4 +5827,43 @@ fn slice_hl(
             (a < b).then(|| (a - from..b - from, *s))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_strips_markers() {
+        let (text, hl) = markdown("**gras** et *italique* `code`", false);
+        assert_eq!(text, "gras et italique code");
+        assert_eq!(hl.len(), 3);
+        let (live, _) = markdown("**gras**", true);
+        assert_eq!(live, "**gras**");
+    }
+
+    #[test]
+    fn mentions_survive_markdown() {
+        let lookup = |k: char, _id: &str| -> Option<String> {
+            match k {
+                'u' => Some("@bob_le_bricoleur".into()),
+                't' => Some("hier".into()),
+                _ => None,
+            }
+        };
+        let resolved = resolve_rich("salut <@123> **ok** <t:1:R>", &lookup);
+        let (t0, h0) = markdown(&resolved, false);
+        let (text, hl, spans) = extract_mentions(&t0, h0);
+        assert_eq!(text, "salut @bob_le_bricoleur ok hier");
+        assert_eq!(&text[spans[0].range.clone()], "@bob_le_bricoleur");
+        assert_eq!(spans[0].id, "123");
+        assert_eq!(&text[hl[0].0.clone()], "ok");
+    }
+
+    #[test]
+    fn links_found() {
+        let l = link_ranges("voir https://a.b/c et http://x.y");
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].1, "https://a.b/c");
+    }
 }
