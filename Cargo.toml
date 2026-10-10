@@ -2,6 +2,7 @@
 name = "discord-test"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 gpui = "0.2.2"
@@ -30,6 +31,9 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 env_logger = { version = "0.11", default-features = false }
 
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

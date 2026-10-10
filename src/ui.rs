@@ -9,7 +9,7 @@ use gpui::{
     rgb, rgba, svg, Animation, AnimationExt, AnyElement, AnyView, App, Context, Div, ExternalPaths,
     FontStyle, FontWeight, HighlightStyle, Image, InteractiveText, KeyDownEvent, MouseButton,
     MouseMoveEvent, ObjectFit, Render, SharedString, Stateful, StrikethroughStyle, StyledImage,
-    StyledText, Svg, UnderlineStyle, Window, WindowControlArea,
+    StyledText, Svg, UnderlineStyle, Window,
 };
 
 use crate::api;
@@ -388,41 +388,6 @@ pub fn icon_button(
             .group_hover(group, |s| s.text_color(rgb(color::bright()))),
         )
         .tooltip(tip(label))
-}
-
-/// Marks an element as a native window-control hit area (custom title bar on Windows).
-pub fn control_area<E: InteractiveElement>(mut el: E, area: WindowControlArea) -> E {
-    el.interactivity().window_control_area(area);
-    el
-}
-
-/// Minimise / maximise / close buttons for the custom title bar (Windows).
-pub fn window_buttons() -> Div {
-    let btn = |id: &'static str, glyph: &'static str, area: WindowControlArea, danger: bool| {
-        let g: SharedString = format!("wb-{id}").into();
-        control_area(
-            div()
-                .id(id)
-                .group(g.clone())
-                .w(px(46.))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(danger, |d| d.hover(|d| d.bg(rgb(0xe81123))))
-                .when(!danger, |d| d.hover(|d| d.bg(rgb(color::hover()))))
-                .child(icon(glyph, 16., color::muted()).group_hover(g, |s| {
-                    s.text_color(rgb(if danger { 0xffffff } else { color::bright() }))
-                })),
-            area,
-        )
-    };
-    div()
-        .h_full()
-        .flex()
-        .child(btn("win-min", "minus", WindowControlArea::Min, false))
-        .child(btn("win-max", "square", WindowControlArea::Max, false))
-        .child(btn("win-close", "x", WindowControlArea::Close, true))
 }
 
 /// Fade + slide-in used by popovers and dialogs.
@@ -1052,77 +1017,66 @@ impl DiscordApp {
             ),
         };
         let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
-        let custom = cfg!(any(target_os = "windows", target_os = "macos"));
-        control_area(
-            div()
-                .id("titlebar")
-                .h(px(36.))
-                .flex_shrink_0()
-                .pl(px(if cfg!(target_os = "macos") { 80. } else { 8. }))
-                .flex()
-                .items_center()
-                .on_mouse_down(MouseButton::Left, |ev, window, _| {
-                    if ev.click_count == 2 {
-                        window.zoom_window();
-                    }
-                }),
-            WindowControlArea::Drag,
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(px(13.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(color::bright()))
-                .child(icon(glyph, 14., color::muted()))
-                .child(title),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .justify_end()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .relative()
-                        .child(
-                            icon_button(
-                                "inbox-btn",
-                                "inbox",
-                                "Boîte de réception",
-                                self.inbox_open,
+        div()
+            .id("titlebar")
+            .h(px(36.))
+            .flex_shrink_0()
+            .pl_2()
+            .flex()
+            .items_center()
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(color::bright()))
+                    .child(icon(glyph, 14., color::muted()))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_end()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                icon_button(
+                                    "inbox-btn",
+                                    "inbox",
+                                    "Boîte de réception",
+                                    self.inbox_open,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_inbox(cx))),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inbox(cx))),
-                        )
-                        .when(mentions > 0, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px(2.))
-                                    .right(px(2.))
-                                    .size(px(8.))
-                                    .rounded_full()
-                                    .bg(rgb(color::red())),
-                            )
-                        }),
-                )
-                .child(
-                    icon_button("switch-btn", "search", "Changement rapide (Ctrl+K)", false)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.switcher = Some(String::new());
-                            this.switcher_sel = 0;
-                            cx.notify();
-                        })),
-                )
-                .when(custom && cfg!(target_os = "windows"), |d| {
-                    d.child(div().w(px(8.))).child(window_buttons())
-                }),
-        )
+                            .when(mentions > 0, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(2.))
+                                        .right(px(2.))
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .bg(rgb(color::red())),
+                                )
+                            }),
+                    )
+                    .child(
+                        icon_button("switch-btn", "search", "Changement rapide (Ctrl+K)", false)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switcher = Some(String::new());
+                                this.switcher_sel = 0;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().w(px(4.))),
+            )
     }
 
     /// Server rail + channel sidebar + floating user panel.
@@ -2924,7 +2878,8 @@ impl DiscordApp {
             }
             let away = {
                 let max = self.scroll.max_offset().height;
-                max > px(0.) && self.scroll.offset().y < -max + px(160.)
+                // offset.y is 0 at the top and -max at the bottom.
+                max > px(0.) && self.scroll.offset().y > -max + px(160.)
             };
             let jump = away.then(|| {
                 div()

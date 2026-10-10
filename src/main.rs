@@ -1,3 +1,6 @@
+// Release builds are GUI apps on Windows: no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod api;
 mod assets;
 mod demo;
@@ -26,6 +29,8 @@ use api::{Channel, Emoji, Guild, GuildEmoji, Message, User};
 
 /// REST polling happens only while the gateway is down.
 const POLL_FAST: Duration = Duration::from_secs(4);
+/// Window title / product name.
+pub const APP_NAME: &str = "GPUI Discord";
 const TYPING_TTL: Duration = Duration::from_secs(8);
 const MAX_INFLIGHT_IMAGES: usize = 16;
 /// Decoded images kept around beyond what is on screen.
@@ -2769,9 +2774,9 @@ impl Render for DiscordApp {
         self.ensure_images(cx);
         let mentions: u32 = self.unread.values().map(|u| u.mentions).sum();
         let title = if self.title_badge && mentions > 0 {
-            format!("({mentions}) Discord")
+            format!("({mentions}) {APP_NAME}")
         } else {
-            "Discord".to_string()
+            APP_NAME.to_string()
         };
         if title != self.last_title {
             window.set_window_title(&title);
@@ -2795,8 +2800,8 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(360.), px(480.))),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Discord".into()),
-                        appears_transparent: true,
+                        title: Some(APP_NAME.into()),
+                        appears_transparent: false,
                         traffic_light_position: Some(gpui::point(px(12.), px(11.))),
                     }),
                     ..Default::default()
