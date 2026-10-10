@@ -29,6 +29,11 @@ pub enum Command {
     },
     /// "online" | "idle" | "dnd" | "invisible".
     SetStatus(String),
+    /// Fetch members (roles, nicknames) for these users of a guild.
+    RequestGuildMembers {
+        guild_id: String,
+        user_ids: Vec<String>,
+    },
     /// Join (`channel_id = Some`) or leave a voice channel / call.
     VoiceState {
         guild_id: Option<String>,
@@ -77,6 +82,10 @@ pub enum Event {
         token: String,
         endpoint: Option<String>,
     },
+    /// Members fetched on demand: (guild, user, roles, nickname).
+    MembersChunk(Vec<(String, User, Vec<String>, Option<String>)>),
+    /// Preloaded user settings protobuf (folders, server order…), decoded from base64.
+    SettingsProto(Vec<u8>),
     /// Voice states present at startup: (guild, channel, user).
     VoiceStates(Vec<(String, String, String)>),
     /// Our session id (needed to run slash commands).
@@ -258,6 +267,14 @@ fn run(
                         .map_err(|e| e.to_string())?;
                     continue;
                 }
+                Command::RequestGuildMembers { guild_id, user_ids } => {
+                    let msg = json!({ "op": 8, "d": {
+                        "guild_id": [guild_id], "user_ids": user_ids, "presences": false,
+                    }});
+                    ws.send(Ws::text(msg.to_string()))
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 Command::SetStatus(status) => {
                     let msg = json!({ "op": 3, "d": {
                         "status": status, "since": 0, "activities": [], "afk": false,
@@ -326,6 +343,12 @@ fn run(
                     let _ = tx.send(Event::Presences(ready_presences(&v["d"])));
                     let _ = tx.send(Event::Roles(ready_roles(&v["d"])));
                     let _ = tx.send(Event::VoiceStates(ready_voice_states(&v["d"])));
+                    if let Some(p) = v["d"]["user_settings_proto"]
+                        .as_str()
+                        .and_then(crate::proto::decode_b64)
+                    {
+                        let _ = tx.send(Event::SettingsProto(p));
+                    }
                 } else if kind == "RESUMED" && tx.send(Event::Connected(true)).is_err() {
                     return Ok(());
                 }
@@ -456,6 +479,35 @@ fn dispatch(kind: &str, d: &Value) -> Option<Event> {
                 Event::MembersStale { guild_id }
             })
         }
+        "GUILD_MEMBERS_CHUNK" => {
+            let gid = s("guild_id");
+            Some(Event::MembersChunk(
+                d["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| {
+                        let user: User = serde_json::from_value(m["user"].clone()).ok()?;
+                        let roles = m["roles"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|r| r.as_str().map(str::to_string))
+                            .collect();
+                        Some((
+                            gid.clone(),
+                            user,
+                            roles,
+                            m["nick"].as_str().map(str::to_string),
+                        ))
+                    })
+                    .collect(),
+            ))
+        }
+        "USER_SETTINGS_PROTO_UPDATE" if d["settings"]["type"] == 1 => d["settings"]["proto"]
+            .as_str()
+            .and_then(crate::proto::decode_b64)
+            .map(Event::SettingsProto),
         "VOICE_STATE_UPDATE" => Some(Event::VoiceStateUpdate {
             guild_id: d["guild_id"].as_str().map(str::to_string),
             channel_id: d["channel_id"].as_str().map(str::to_string),

@@ -1,6 +1,7 @@
 //! Discord-style layout: server rail, channel sidebar, chat pane, login screen.
 
 use chrono::{DateTime, Datelike, Local, Timelike};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -8,8 +9,8 @@ use gpui::{
     div, ease_in_out, img, linear_color_stop, linear_gradient, prelude::*, pulsating_between, px,
     rgb, rgba, svg, Animation, AnimationExt, AnyElement, AnyView, App, Context, Div, ExternalPaths,
     FontStyle, FontWeight, HighlightStyle, Image, InteractiveText, KeyDownEvent, MouseButton,
-    MouseMoveEvent, ObjectFit, Render, SharedString, Stateful, StrikethroughStyle, StyledImage,
-    StyledText, Svg, UnderlineStyle, Window,
+    MouseMoveEvent, ObjectFit, Render, ScrollWheelEvent, SharedString, Stateful,
+    StrikethroughStyle, StyledImage, StyledText, Svg, UnderlineStyle, Window,
 };
 
 use crate::api;
@@ -401,6 +402,187 @@ pub fn appear<E: IntoElement + Styled + 'static>(id: impl Into<SharedString>, el
     .into_any_element()
 }
 
+/// Media for "image" / "gifv" embeds: (display url, natural size, url to open).
+pub fn embed_media(e: &crate::api::Embed) -> Option<(String, (f32, f32), String)> {
+    let kind = e.kind.as_deref()?;
+    let thumb = e.thumbnail.as_ref();
+    let size = |m: Option<&crate::api::EmbedMedia>| {
+        m.map(|m| {
+            (
+                m.width.unwrap_or(400) as f32,
+                m.height.unwrap_or(300) as f32,
+            )
+        })
+        .unwrap_or((400., 300.))
+    };
+    match kind {
+        "gifv" => {
+            let gif = e.video.as_ref().and_then(|v| v.tenor_gif());
+            let url = gif.or_else(|| thumb.map(|t| t.large_url()))?;
+            Some((
+                url,
+                size(e.video.as_ref().or(thumb)),
+                e.url.clone().unwrap_or_default(),
+            ))
+        }
+        "image" => {
+            let m = thumb.or(e.image.as_ref())?;
+            Some((m.large_url(), size(Some(m)), m.url.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Preview for a favourite GIF: Tenor MP4s have a small GIF twin.
+pub fn fav_preview(src: &str) -> String {
+    if src.contains("media.tenor.com") && src.ends_with(".mp4") {
+        src.replace("AAAPo/", "AAAAM/").replace(".mp4", ".gif")
+    } else {
+        src.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+const MONO_FONT: &str = "Consolas";
+#[cfg(target_os = "macos")]
+const MONO_FONT: &str = "Menlo";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const MONO_FONT: &str = "DejaVu Sans Mono";
+
+#[derive(Debug, PartialEq)]
+enum Block {
+    Para(String),
+    Heading(u8, String),
+    Sub(String),
+    Quote(String),
+    Item(String, String),
+    Code(String),
+}
+
+/// Splits a message into Discord Markdown blocks.
+fn parse_blocks(src: &str) -> Vec<Block> {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut out = Vec::new();
+    let mut para: Vec<&str> = Vec::new();
+    let flush = |para: &mut Vec<&str>, out: &mut Vec<Block>| {
+        if !para.is_empty() {
+            out.push(Block::Para(para.join("\n")));
+            para.clear();
+        }
+    };
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("```") {
+            flush(&mut para, &mut out);
+            // Same-line fence: ```code```
+            if let Some(end) = rest.find("```") {
+                out.push(Block::Code(rest[..end].to_string()));
+                i += 1;
+                continue;
+            }
+            let mut code = Vec::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+                code.push(lines[i]);
+                i += 1;
+            }
+            // `rest` is the language tag; skip it.
+            out.push(Block::Code(code.join("\n")));
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix(">>> ") {
+            flush(&mut para, &mut out);
+            let mut q = vec![rest];
+            q.extend(&lines[i + 1..]);
+            out.push(Block::Quote(q.join("\n")));
+            break;
+        }
+        if l.starts_with("> ") || l == ">" {
+            flush(&mut para, &mut out);
+            let mut q = Vec::new();
+            while i < lines.len() && (lines[i].starts_with("> ") || lines[i] == ">") {
+                q.push(lines[i].strip_prefix("> ").unwrap_or(""));
+                i += 1;
+            }
+            out.push(Block::Quote(q.join("\n")));
+            continue;
+        }
+        let heading = [("### ", 3u8), ("## ", 2), ("# ", 1)]
+            .into_iter()
+            .find_map(|(p, n)| l.strip_prefix(p).map(|r| (n, r)));
+        if let Some((n, r)) = heading {
+            flush(&mut para, &mut out);
+            out.push(Block::Heading(n, r.to_string()));
+        } else if let Some(r) = l.strip_prefix("-# ") {
+            flush(&mut para, &mut out);
+            out.push(Block::Sub(r.to_string()));
+        } else if let Some(r) = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* ").filter(|_| !t.starts_with("**")))
+        {
+            flush(&mut para, &mut out);
+            out.push(Block::Item("•".into(), r.to_string()));
+        } else if let Some((num, r)) = t
+            .split_once(". ")
+            .filter(|(n, _)| !n.is_empty() && n.len() < 4 && n.chars().all(|c| c.is_ascii_digit()))
+        {
+            flush(&mut para, &mut out);
+            out.push(Block::Item(format!("{num}."), r.to_string()));
+        } else {
+            para.push(l);
+        }
+        i += 1;
+    }
+    flush(&mut para, &mut out);
+    if out.is_empty() {
+        out.push(Block::Para(String::new()));
+    }
+    out
+}
+
+/// Turns `[label](url)` into link markers and `||text||` into spoiler markers
+/// (handled like mentions by [`extract_mentions`]).
+fn links_and_spoilers(src: &str, plain: &dyn Fn(char, &str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let mut n = 0;
+    while !rest.is_empty() {
+        if let Some(body) = rest.strip_prefix("||") {
+            if let Some(end) = body.find("||").filter(|e| *e > 0) {
+                let inner = resolve_tokens(&body[..end], plain);
+                out.push_str(&format!("{MARK_OPEN}s{n}{MARK_SEP}{inner}{MARK_CLOSE}"));
+                n += 1;
+                rest = &body[end + 2..];
+                continue;
+            }
+        }
+        if rest.starts_with('[') {
+            if let Some(close) = rest.find("](") {
+                let label = &rest[1..close];
+                let after = &rest[close + 2..];
+                if let Some(end) = after.find(')') {
+                    let url = &after[..end];
+                    if !label.contains('\n')
+                        && (url.starts_with("http://") || url.starts_with("https://"))
+                    {
+                        let url = url.trim_matches(|c| c == '<' || c == '>');
+                        out.push_str(&format!("{MARK_OPEN}l{url}{MARK_SEP}{label}{MARK_CLOSE}"));
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 fn status_color(status: &str) -> Option<u32> {
     match status {
         "online" => Some(color::green()),
@@ -622,6 +804,7 @@ fn resolve_rich(src: &str, lookup: &dyn Fn(char, &str) -> Option<String>) -> Str
 
 #[derive(Clone)]
 pub enum Action {
+    Spoiler(String),
     Url(String),
     User(String),
     Channel(String),
@@ -962,6 +1145,7 @@ impl DiscordApp {
         let settings = self.settings.then(|| self.settings_overlay(cx));
         let inbox = self.inbox_open.then(|| self.inbox_popover(cx));
         let status = self.status_menu.then(|| self.status_popover(cx));
+        let lightbox = self.lightbox_overlay(cx);
         let size = match self.density.as_str() {
             "compact" => 14.,
             "spacious" => 16.,
@@ -1000,6 +1184,156 @@ impl DiscordApp {
             .children(profile)
             .children(settings)
             .children(switcher)
+            .children(lightbox)
+    }
+
+    fn lightbox_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let lb = self.lightbox.as_ref()?;
+        let (avail_w, avail_h) = ((self.width - 96.).max(200.), (self.height - 160.).max(200.));
+        let fit = (avail_w / lb.w.max(1.)).min(avail_h / lb.h.max(1.));
+        let (w, h) = (lb.w * fit * lb.zoom, lb.h * fit * lb.zoom);
+        let image: AnyElement = match self.images.get(&lb.full) {
+            Some(i) => img(i.clone())
+                .w(px(w))
+                .h(px(h))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            None if self.image_failed.contains(&lb.full) => div()
+                .text_color(rgb(0xdbdee1))
+                .child("Impossible de charger l'image.")
+                .into_any_element(),
+            None => skeleton("sk-lightbox", Some(w), h, Some(8.)),
+        };
+        let open = lb.open.clone();
+        let copy = lb.open.clone();
+        let zoom_pct = format!("{} %", (lb.zoom * 100.).round());
+        let tool = |id: &'static str, glyph: &'static str, label: &'static str| {
+            let g: SharedString = format!("lbt-{id}").into();
+            div()
+                .id(id)
+                .group(g.clone())
+                .size(px(36.))
+                .rounded(px(8.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgba(0xffffff1f)))
+                .child(icon(glyph, 20., 0xdbdee1).group_hover(g, |s| s.text_color(rgb(0xffffff))))
+                .tooltip(tip(label))
+        };
+        Some(appear(
+            "lightbox-anim",
+            div()
+                .id("lightbox")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x000000e6))
+                .flex()
+                .flex_col()
+                .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                    if !(ev.modifiers.control || ev.modifiers.platform) {
+                        return;
+                    }
+                    let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
+                    if let Some(lb) = &mut this.lightbox {
+                        lb.zoom = (lb.zoom * if dy > 0. { 1.1 } else { 1. / 1.1 }).clamp(0.25, 6.);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .h(px(52.))
+                        .flex_shrink_0()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().flex_1())
+                        .child(
+                            tool("lb-out", "minus", "Dézoomer (Ctrl + molette)").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(lb) = &mut this.lightbox {
+                                        lb.zoom = (lb.zoom / 1.25).max(0.25);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("lb-reset")
+                                .w(px(64.))
+                                .text_center()
+                                .text_sm()
+                                .cursor_pointer()
+                                .text_color(rgb(0xdbdee1))
+                                .child(zoom_pct)
+                                .tooltip(tip("Taille ajustée"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(lb) = &mut this.lightbox {
+                                        lb.zoom = 1.;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(tool("lb-in", "plus", "Zoomer (Ctrl + molette)").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(lb) = &mut this.lightbox {
+                                    lb.zoom = (lb.zoom * 1.25).min(6.);
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                        .child(div().w(px(12.)))
+                        .child(tool("lb-copy", "link", "Copier le lien").on_click(
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
+                            },
+                        ))
+                        .child(
+                            tool("lb-open", "external-link", "Ouvrir dans le navigateur")
+                                .on_click(move |_, _, cx| cx.open_url(&open)),
+                        )
+                        .child(
+                            tool("lb-close", "x", "Fermer (Échap)").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.lightbox = None;
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("lb-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_scroll()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.lightbox = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .min_w_full()
+                                .min_h_full()
+                                .p_6()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .id("lb-image")
+                                        .on_click(|_, _, cx| cx.stop_propagation())
+                                        .child(image),
+                                ),
+                        ),
+                ),
+        ))
     }
 
     /// Thin top bar (2025 layout): current place in the middle, inbox on the right.
@@ -1122,6 +1456,114 @@ impl DiscordApp {
             )
     }
 
+    fn guild_slot(&self, g: &crate::api::Guild, cx: &mut Context<Self>) -> Div {
+        let active = self.guild.as_deref() == Some(&g.id);
+        let id = g.id.clone();
+        let img_ = g.icon_url().and_then(|u| self.images.get(&u).cloned());
+        let mine = || {
+            self.unread
+                .values()
+                .filter(|u| u.guild.as_deref() == Some(&g.id))
+        };
+        let (unread, mentions) = (mine().next().is_some(), mine().map(|u| u.mentions).sum());
+        rail_slot(
+            rail_button(format!("g-{}", g.id), active, acronym(&g.name), img_)
+                .tooltip(tip(g.name.clone()))
+                .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx))),
+            active,
+            unread,
+            mentions,
+        )
+    }
+
+    /// Server folder: collapsed = 2×2 mini icons, expanded = tinted group.
+    fn folder_slot(
+        &self,
+        f: &crate::proto::Folder,
+        guilds: Vec<&crate::api::Guild>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let fid = f.id.unwrap_or(0);
+        let open = self.expanded_folders.contains(&fid);
+        let tint = f.color.filter(|c| *c != 0).unwrap_or(color::brand());
+        let ids: Vec<&str> = guilds.iter().map(|g| g.id.as_str()).collect();
+        let unread_list = || {
+            self.unread
+                .values()
+                .filter(|u| u.guild.as_deref().is_some_and(|g| ids.contains(&g)))
+        };
+        let (unread, mentions) = (
+            unread_list().next().is_some(),
+            unread_list().map(|u| u.mentions).sum(),
+        );
+        let active = self.guild.as_deref().is_some_and(|g| ids.contains(&g));
+        let name = f.name.clone().unwrap_or_else(|| "Dossier".into());
+        let header = div()
+            .id(SharedString::from(format!("folder-{fid}")))
+            .size(px(40.))
+            .rounded(px(12.))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba((tint << 8) | if open { 0x00 } else { 0x40 }))
+            .hover(|d| d.bg(rgba((tint << 8) | 0x60)))
+            .tooltip(tip(name))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_folders.remove(&fid) {
+                    this.expanded_folders.insert(fid);
+                }
+                cx.notify();
+            }));
+        let header = if open {
+            header.child(icon("folder", 22., tint))
+        } else {
+            // 2×2 grid of the first guilds.
+            header
+                .p(px(5.))
+                .child(div().size_full().flex().flex_wrap().gap(px(2.)).children(
+                    guilds.iter().take(4).map(|g| {
+                        match g.icon_url().and_then(|u| self.images.get(&u).cloned()) {
+                            Some(i) => round_image(i, 13., Some(4.)),
+                            None => div()
+                                .size(px(13.))
+                                .rounded(px(4.))
+                                .bg(rgb(color::active()))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(6.))
+                                .text_color(rgb(color::bright()))
+                                .child(acronym(&g.name).chars().take(2).collect::<String>())
+                                .into_any_element(),
+                        }
+                    }),
+                ))
+        };
+        let slot = rail_slot(
+            header,
+            active && !open,
+            unread && !open,
+            if open { 0 } else { mentions },
+        );
+        if !open {
+            return slot;
+        }
+        div().w_full().flex().flex_col().items_center().child(
+            div()
+                .w(px(48.))
+                .py_1()
+                .rounded(px(14.))
+                .bg(rgba((tint << 8) | 0x26))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(slot)
+                .children(guilds.into_iter().map(|g| self.guild_slot(g, cx))),
+        )
+    }
+
     fn rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let home_active = self.guild.is_none();
         let dm_unread = self.unread.values().any(|u| u.guild.is_none());
@@ -1160,25 +1602,34 @@ impl DiscordApp {
             dm_unread,
             dm_mentions,
         );
-        let guilds = self.guilds.iter().map(|g| {
-            let active = self.guild.as_deref() == Some(&g.id);
-            let id = g.id.clone();
-            let img_ = g.icon_url().and_then(|u| self.images.get(&u).cloned());
-            let mine = || {
-                self.unread
-                    .values()
-                    .filter(|u| u.guild.as_deref() == Some(&g.id))
-            };
-            let (unread, mentions) = (mine().next().is_some(), mine().map(|u| u.mentions).sum());
-            rail_slot(
-                rail_button(format!("g-{}", g.id), active, acronym(&g.name), img_)
-                    .tooltip(tip(g.name.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_guild(id.clone(), cx))),
-                active,
-                unread,
-                mentions,
-            )
-        });
+        // Order and folders come from the user's settings (same as the official client).
+        let mut entries: Vec<Div> = Vec::new();
+        let by_id = |id: &str| self.guilds.iter().find(|g| g.id == id);
+        let placed: HashSet<&str> = self
+            .folders
+            .iter()
+            .flat_map(|f| f.guild_ids.iter().map(|s| s.as_str()))
+            .collect();
+        // Guilds missing from the settings (just joined) go first, like Discord.
+        for g in self
+            .guilds
+            .iter()
+            .filter(|g| !placed.contains(g.id.as_str()))
+        {
+            entries.push(self.guild_slot(g, cx));
+        }
+        for f in &self.folders {
+            let gs: Vec<&crate::api::Guild> =
+                f.guild_ids.iter().filter_map(|id| by_id(id)).collect();
+            if gs.is_empty() {
+                continue;
+            }
+            if f.id.is_none() && gs.len() == 1 {
+                entries.push(self.guild_slot(gs[0], cx));
+            } else {
+                entries.push(self.folder_slot(f, gs, cx));
+            }
+        }
         div()
             .id("rail")
             .w(px(72.))
@@ -1199,7 +1650,7 @@ impl DiscordApp {
                     .flex_shrink_0()
                     .bg(rgb(color::divider())),
             )
-            .children(guilds)
+            .children(entries)
     }
 
     // ---- channel sidebar -----------------------------------------------
@@ -2876,7 +3327,10 @@ impl DiscordApp {
                     self.jump_to = None;
                 }
             }
-            let away = {
+            if self.stick && self.jump_to.is_none() {
+                self.scroll.scroll_to_bottom();
+            }
+            let away = !self.stick && {
                 let max = self.scroll.max_offset().height;
                 // offset.y is 0 at the top and -max at the bottom.
                 max > px(0.) && self.scroll.offset().y > -max + px(160.)
@@ -2909,6 +3363,7 @@ impl DiscordApp {
                             .child("Aller aux messages récents")
                             .child(icon("arrow-down", 14., 0xffffff))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.stick = true;
                                 this.scroll.scroll_to_bottom();
                                 cx.notify();
                             })),
@@ -2927,6 +3382,19 @@ impl DiscordApp {
                         .min_h_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
+                        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                            let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
+                            if dy > 0. {
+                                this.stick = false;
+                            } else if dy < 0. {
+                                let max = this.scroll.max_offset().height;
+                                let y = this.scroll.offset().y + px(dy);
+                                if y <= -max + px(40.) {
+                                    this.stick = true;
+                                }
+                            }
+                            cx.notify();
+                        }))
                         .flex()
                         .flex_col()
                         .children(older)
@@ -3240,7 +3708,249 @@ impl DiscordApp {
                     tab("tab-gif", "GIF", self.picker_tab == PickerTab::Gif)
                         .on_click(cx.listener(|this, _, _, cx| this.open_gif_tab(cx))),
                 )
+                .child(
+                    tab(
+                        "tab-sticker",
+                        "Stickers",
+                        self.picker_tab == PickerTab::Sticker,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.open_sticker_tab(cx))),
+                )
             })
+    }
+
+    /// One GIF tile with a favourite star (top-right), like Discord.
+    fn gif_tile(
+        &self,
+        id: String,
+        preview: &str,
+        title: &str,
+        fav: crate::proto::FavGif,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let starred = self.is_fav(&fav.url);
+        let group: SharedString = format!("gt-{id}").into();
+        let send = fav.url.clone();
+        let tile = div()
+            .id(SharedString::from(id.clone()))
+            .group(group.clone())
+            .relative()
+            .w(px(108.))
+            .h(px(84.))
+            .rounded(px(6.))
+            .overflow_hidden()
+            .bg(rgb(color::hover()))
+            .cursor_pointer();
+        let tile = match self.images.get(preview) {
+            Some(im) => tile.child(
+                img(im.clone())
+                    .w(px(108.))
+                    .h(px(84.))
+                    .object_fit(ObjectFit::Cover),
+            ),
+            None => tile.flex().items_center().justify_center().child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(color::muted()))
+                    .child(title.chars().take(14).collect::<String>()),
+            ),
+        };
+        tile.child(
+            div()
+                .id(SharedString::from(format!("{id}-star")))
+                .absolute()
+                .top(px(4.))
+                .right(px(4.))
+                .size(px(24.))
+                .rounded_full()
+                .bg(rgba(0x000000a0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(!starred, |d| {
+                    d.opacity(0.).group_hover(group, |s| s.opacity(1.))
+                })
+                .child(icon(
+                    "star",
+                    14.,
+                    if starred { color::yellow() } else { 0xffffff },
+                ))
+                .tooltip(tip(if starred {
+                    "Retirer des favoris"
+                } else {
+                    "Ajouter aux favoris"
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_fav(fav.clone(), cx);
+                })),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.send_gif(send.clone(), cx)))
+    }
+
+    fn gif_sections(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let grid = || div().flex().flex_wrap().gap_1();
+        let mut out = Vec::new();
+        if self.gif_query.is_empty() {
+            if !self.fav_gifs.is_empty() {
+                out.push(
+                    Self::section_label(format!("FAVORIS — {}", self.fav_gifs.len()))
+                        .into_any_element(),
+                );
+                let favs: Vec<_> = self
+                    .fav_gifs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| {
+                        self.gif_tile(
+                            format!("fav-{i}"),
+                            &fav_preview(&g.src),
+                            "GIF",
+                            g.clone(),
+                            cx,
+                        )
+                    })
+                    .collect();
+                out.push(grid().children(favs).into_any_element());
+            }
+            if !self.gif_categories.is_empty() {
+                out.push(Self::section_label("CATÉGORIES".into()).into_any_element());
+                let cats: Vec<_> = self
+                    .gif_categories
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, src))| {
+                        let q = name.clone();
+                        div()
+                            .id(SharedString::from(format!("cat-gif-{i}")))
+                            .relative()
+                            .w(px(108.))
+                            .h(px(60.))
+                            .rounded(px(6.))
+                            .overflow_hidden()
+                            .bg(rgb(color::brand()))
+                            .cursor_pointer()
+                            .when_some(self.images.get(src).cloned(), |d, im| {
+                                d.child(
+                                    img(im)
+                                        .w(px(108.))
+                                        .h(px(60.))
+                                        .object_fit(ObjectFit::Cover)
+                                        .opacity(0.55),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child(name.clone()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.gif_query = q.clone();
+                                this.load_gifs(cx);
+                            }))
+                    })
+                    .collect();
+                out.push(grid().children(cats).into_any_element());
+            }
+            out.push(Self::section_label("TENDANCES".into()).into_any_element());
+        }
+        let tiles: Vec<_> = self
+            .gifs
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let fav = crate::proto::FavGif {
+                    url: g.url.clone(),
+                    src: g.src.clone(),
+                    width: g.width,
+                    height: g.height,
+                    order: 0,
+                };
+                self.gif_tile(format!("gif-{i}"), &g.preview, &g.title, fav, cx)
+            })
+            .collect();
+        out.push(grid().children(tiles).into_any_element());
+        out
+    }
+
+    fn sticker_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let list = self
+            .guild
+            .as_ref()
+            .and_then(|g| self.guild_stickers.get(g))
+            .cloned()
+            .unwrap_or_default();
+        let mut body = div()
+            .id("sticker-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2();
+        if self.guild.is_none() {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(color::muted()))
+                    .child("Les stickers de serveur s'affichent dans un serveur."),
+            );
+        } else if list.is_empty() {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(color::muted()))
+                    .child("Aucun sticker sur ce serveur."),
+            );
+        } else {
+            body =
+                body.child(Self::section_label("CE SERVEUR".into())).child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(list.into_iter().map(|s| {
+                            let id = s.id.clone();
+                            let pic: AnyElement =
+                                match s.url().and_then(|u| self.images.get(&u).cloned()) {
+                                    Some(i) => img(i)
+                                        .size(px(72.))
+                                        .object_fit(ObjectFit::Contain)
+                                        .into_any_element(),
+                                    None => div()
+                                        .text_xs()
+                                        .text_color(rgb(color::muted()))
+                                        .child(s.name.clone())
+                                        .into_any_element(),
+                                };
+                            div()
+                                .id(SharedString::from(format!("stk-{}", s.id)))
+                                .size(px(84.))
+                                .rounded(px(8.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgb(color::hover())))
+                                .child(pic)
+                                .tooltip(tip(s.name.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send_sticker(id.clone(), cx)
+                                }))
+                        })),
+                );
+        }
+        body.into_any_element()
     }
 
     fn gif_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3289,37 +3999,7 @@ impl DiscordApp {
                                 .child(self.gif_note.clone()),
                         )
                     })
-                    .child(div().flex().flex_wrap().gap_1().children(
-                        self.gifs.iter().enumerate().map(|(i, g)| {
-                            let url = g.url.clone();
-                            let tile = div()
-                                .id(SharedString::from(format!("gif-{i}")))
-                                .w(px(108.))
-                                .h(px(84.))
-                                .rounded(px(4.))
-                                .overflow_hidden()
-                                .bg(rgb(color::rail()))
-                                .cursor_pointer()
-                                .hover(|d| d.opacity(0.8));
-                            match self.images.get(&g.preview) {
-                                Some(im) => tile.child(
-                                    img(im.clone())
-                                        .w(px(108.))
-                                        .h(px(84.))
-                                        .object_fit(ObjectFit::Cover),
-                                ),
-                                None => tile.flex().items_center().justify_center().child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(color::muted()))
-                                        .child(g.title.chars().take(14).collect::<String>()),
-                                ),
-                            }
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.send_gif(url.clone(), cx)),
-                            )
-                        }),
-                    )),
+                    .children(self.gif_sections(cx)),
             )
             .into_any_element()
     }
@@ -3420,10 +4100,10 @@ impl DiscordApp {
                         .flex_col()
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(self.picker_tabs(cx))
-                        .child(if self.picker_tab == PickerTab::Gif && composer {
-                            self.gif_body(cx)
-                        } else {
-                            body.into_any_element()
+                        .child(match self.picker_tab {
+                            PickerTab::Gif if composer => self.gif_body(cx),
+                            PickerTab::Sticker if composer => self.sticker_body(cx),
+                            _ => body.into_any_element(),
                         }),
                 ),
         )
@@ -5029,8 +5709,15 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    /// Message text with mentions resolved and Markdown applied.
-    fn rich_text(&self, m: &Message, edited: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// One run of inline text (mentions, Markdown, masked links, spoilers).
+    fn inline_text(
+        &self,
+        m: &Message,
+        src: &str,
+        key: String,
+        edited: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let lookup = |kind: char, id: &str| -> Option<String> {
             match kind {
                 'u' => m
@@ -5055,7 +5742,17 @@ impl DiscordApp {
                 _ => None,
             }
         };
-        let resolved = resolve_rich(&m.content, &lookup);
+        let plain = |k: char, i: &str| {
+            lookup(
+                match k {
+                    '@' => 'u',
+                    '&' => 'r',
+                    o => o,
+                },
+                i,
+            )
+        };
+        let resolved = resolve_rich(&links_and_spoilers(src, &plain), &lookup);
         let (text0, hl0) = markdown(&resolved, false);
         let (mut text, hl, spans) = extract_mentions(&text0, hl0);
 
@@ -5068,7 +5765,26 @@ impl DiscordApp {
             let role_color = (s.kind == 'r')
                 .then(|| self.roles.get(&s.id).map(|r| r.color).filter(|c| *c != 0))
                 .flatten();
+            let spoiler_key = format!("{}:{}", m.id, s.id);
             let style = match (s.kind, role_color) {
+                ('l', _) => HighlightStyle {
+                    color: Some(rgb(color::link()).into()),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: None,
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+                ('s', _) if self.revealed.contains(&spoiler_key) => HighlightStyle {
+                    background_color: Some(rgba(0x80808033).into()),
+                    ..Default::default()
+                },
+                ('s', _) => HighlightStyle {
+                    color: Some(rgb(color::frame()).into()),
+                    background_color: Some(rgb(color::frame()).into()),
+                    ..Default::default()
+                },
                 (_, Some(c)) => HighlightStyle {
                     color: Some(rgb(c).into()),
                     background_color: Some(rgba((c << 8) | 0x33).into()),
@@ -5113,16 +5829,27 @@ impl DiscordApp {
                     ranges.push(s.range.clone());
                     actions.push(Action::Channel(s.id.clone()));
                 }
+                'l' => {
+                    ranges.push(s.range.clone());
+                    actions.push(Action::Url(s.id.clone()));
+                }
+                's' => {
+                    ranges.push(s.range.clone());
+                    actions.push(Action::Spoiler(format!("{}:{}", m.id, s.id)));
+                }
                 _ => {}
             }
         }
-        for (r, url) in link_ranges(&text) {
+        for (r, url) in link_ranges(&text)
+            .into_iter()
+            .filter(|(r, _)| !spans.iter().any(|s| overlaps(&s.range, r)))
+        {
             ranges.push(r);
             actions.push(Action::Url(url));
         }
         let weak = cx.entity().downgrade();
         InteractiveText::new(
-            SharedString::from(format!("t-{}", m.id)),
+            SharedString::from(key),
             StyledText::new(text).with_highlights(styled),
         )
         .on_click(ranges, move |ix, _, app| match &actions[ix] {
@@ -5132,6 +5859,14 @@ impl DiscordApp {
                 weak.update(app, |this, cx| this.open_profile_id(&id, cx))
                     .ok();
             }
+            Action::Spoiler(k) => {
+                let k = k.clone();
+                weak.update(app, |this, cx| {
+                    this.revealed.insert(k);
+                    cx.notify();
+                })
+                .ok();
+            }
             Action::Channel(id) => {
                 let id = id.clone();
                 weak.update(app, |this, cx| this.open_channel_id(&id, cx))
@@ -5139,6 +5874,84 @@ impl DiscordApp {
             }
         })
         .into_any_element()
+    }
+
+    /// Message body: Discord-flavoured Markdown blocks (headings, quotes, lists,
+    /// code blocks, sub-text) around inline runs.
+    fn rich_text(&self, m: &Message, edited: bool, cx: &mut Context<Self>) -> AnyElement {
+        let blocks = parse_blocks(&m.content);
+        let last = blocks.len().saturating_sub(1);
+        let mut col = div().flex().flex_col().gap_1().min_w_0();
+        for (i, b) in blocks.into_iter().enumerate() {
+            let key = format!("t-{}-{i}", m.id);
+            let ed = edited && i == last;
+            col = col.child(match b {
+                Block::Para(t) => self.inline_text(m, &t, key, ed, cx),
+                Block::Heading(level, t) => div()
+                    .mt_1()
+                    .text_size(px(match level {
+                        1 => 24.,
+                        2 => 20.,
+                        _ => 17.,
+                    }))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(color::bright()))
+                    .child(self.inline_text(m, &t, key, ed, cx))
+                    .into_any_element(),
+                Block::Sub(t) => div()
+                    .text_xs()
+                    .text_color(rgb(color::muted()))
+                    .child(self.inline_text(m, &t, key, ed, cx))
+                    .into_any_element(),
+                Block::Quote(t) => div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(4.))
+                            .flex_shrink_0()
+                            .rounded(px(2.))
+                            .bg(rgb(color::divider())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.inline_text(m, &t, key, ed, cx)),
+                    )
+                    .into_any_element(),
+                Block::Item(bullet, t) => div()
+                    .flex()
+                    .gap_2()
+                    .pl_1()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(color::muted()))
+                            .child(bullet),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.inline_text(m, &t, key, ed, cx)),
+                    )
+                    .into_any_element(),
+                Block::Code(t) => div()
+                    .max_w(px(640.))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(6.))
+                    .bg(rgb(color::code_bg()))
+                    .border_1()
+                    .border_color(rgb(color::border()))
+                    .font_family(MONO_FONT)
+                    .text_size(px(13.))
+                    .child(t)
+                    .into_any_element(),
+            });
+        }
+        col.into_any_element()
     }
 
     /// Single-line preview of a message for reply headers.
@@ -5308,61 +6121,131 @@ impl DiscordApp {
             .into_any_element()
     }
 
-    fn attachment(&self, a: &crate::api::Attachment) -> AnyElement {
-        if a.is_image() {
-            let (w, h) = (
-                a.width.unwrap_or(400) as f32,
-                a.height.unwrap_or(300) as f32,
-            );
-            let scale = (400. / w).min(300. / h).min(1.);
-            let (w, h) = ((w * scale).max(32.), (h * scale).max(32.));
-            return match self.images.get(&a.preview_url()) {
-                Some(i) => img(i.clone())
-                    .w(px(w))
-                    .h(px(h))
-                    .rounded(px(8.))
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element(),
-                None if self.image_failed.contains(&a.preview_url()) => div()
-                    .px_3()
-                    .py_2()
-                    .rounded(px(4.))
-                    .bg(rgb(color::sidebar()))
-                    .text_color(rgb(color::link()))
-                    .child(a.filename.clone())
-                    .into_any_element(),
-                None => skeleton(format!("sk-att-{}", a.url), Some(w), h, Some(8.)),
-            };
-        }
+    /// Image box scaled to fit `max_w`×`max_h`, with skeleton while loading;
+    /// clicking opens the viewer.
+    fn media_box(
+        &self,
+        id: String,
+        url: String,
+        (w, h): (f32, f32),
+        (max_w, max_h): (f32, f32),
+        viewer: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scale = (max_w / w.max(1.)).min(max_h / h.max(1.)).min(1.);
+        let (w, h) = ((w * scale).max(48.), (h * scale).max(48.));
+        let el: AnyElement = match self.images.get(&url) {
+            Some(i) => img(i.clone())
+                .w(px(w))
+                .h(px(h))
+                .rounded(px(8.))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            None if self.image_failed.contains(&url) => div()
+                .w(px(w))
+                .h(px(h))
+                .rounded(px(8.))
+                .bg(rgb(color::input()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon("image", 28., color::muted()))
+                .into_any_element(),
+            None => skeleton(format!("sk-{id}"), Some(w), h, Some(8.)),
+        };
+        let sw = (w, h);
         div()
-            .px_3()
-            .py_2()
-            .rounded(px(4.))
-            .bg(rgb(color::sidebar()))
-            .text_color(rgb(color::link()))
-            .child(a.filename.clone())
+            .id(SharedString::from(id))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|d| d.opacity(0.92))
+            .child(el)
+            .when_some(viewer, |d, (full, open)| {
+                d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_lightbox(full.clone(), open.clone(), sw.0, sw.1, cx)
+                }))
+            })
             .into_any_element()
     }
 
-    fn embed(&self, e: &crate::api::Embed) -> AnyElement {
+    fn attachment(&self, a: &crate::api::Attachment, cx: &mut Context<Self>) -> AnyElement {
+        if a.is_image() {
+            let size = (
+                a.width.unwrap_or(400) as f32,
+                a.height.unwrap_or(300) as f32,
+            );
+            return self.media_box(
+                format!("att-{}", a.url),
+                a.display_url(),
+                size,
+                (420., 320.),
+                Some((a.large_url(), a.url.clone())),
+                cx,
+            );
+        }
+        let url = a.url.clone();
+        div()
+            .id(SharedString::from(format!("file-{}", a.url)))
+            .max_w(px(420.))
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .bg(rgb(color::panel()))
+            .border_1()
+            .border_color(rgb(color::border()))
+            .flex()
+            .items_center()
+            .gap_3()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(color::hover())))
+            .child(icon("file-text", 28., color::link()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(color::link()))
+                    .child(a.filename.clone()),
+            )
+            .child(icon("download", 18., color::muted()))
+            .tooltip(tip("Ouvrir / télécharger"))
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element()
+    }
+
+    fn embed(&self, e: &crate::api::Embed, key: String, cx: &mut Context<Self>) -> AnyElement {
+        // Bare media embeds (Tenor GIFs, image links) render as the media itself.
+        if let Some((url, size, open)) = embed_media(e) {
+            return self.media_box(key, url.clone(), size, (420., 320.), Some((url, open)), cx);
+        }
         let mut body = div().flex().flex_col().gap_1().min_w_0();
         if let Some(a) = &e.author {
             body = body.child(
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(color::bright()))
                     .child(a.name.clone()),
             );
         }
         if let Some(t) = &e.title {
+            let link = e.url.clone();
             body = body.child(
                 div()
+                    .id(SharedString::from(format!("{key}-t")))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(if e.url.is_some() {
+                    .text_color(rgb(if link.is_some() {
                         color::link()
                     } else {
                         color::bright()
                     }))
+                    .when_some(link, |d, u| {
+                        d.cursor_pointer()
+                            .hover(|d| d.underline())
+                            .on_click(move |_, _, cx| cx.open_url(&u))
+                    })
                     .child(t.clone()),
             );
         }
@@ -5386,42 +6269,45 @@ impl DiscordApp {
                             .text_color(rgb(color::bright()))
                             .child(f.name.clone()),
                     )
-                    .child(div().text_sm().child(f.value.clone())),
+                    .child({
+                        let (text, hl) = markdown(&f.value, false);
+                        div()
+                            .text_sm()
+                            .child(StyledText::new(text).with_highlights(hl))
+                    }),
             );
         }
-        if let Some(i) = e
-            .image
-            .as_ref()
-            .and_then(|m| self.images.get(&m.preview_url()))
-        {
-            body = body.child(
-                img(i.clone())
-                    .w(px(360.))
-                    .h(px(220.))
-                    .rounded(px(4.))
-                    .object_fit(ObjectFit::Contain),
+        if let Some(im) = &e.image {
+            let size = (
+                im.width.unwrap_or(400) as f32,
+                im.height.unwrap_or(300) as f32,
             );
+            body = body.child(div().mt_2().child(self.media_box(
+                format!("{key}-img"),
+                im.preview_url(),
+                size,
+                (400., 300.),
+                Some((im.large_url(), im.url.clone())),
+                cx,
+            )));
         }
         let mut row = div().flex().gap_3().child(body.flex_1());
-        if let Some(i) = e
-            .thumbnail
-            .as_ref()
-            .and_then(|m| self.images.get(&m.preview_url()))
-        {
-            row = row.child(
-                img(i.clone())
-                    .size(px(64.))
-                    .flex_shrink_0()
-                    .rounded(px(4.))
-                    .object_fit(ObjectFit::Cover),
-            );
+        if let Some(th) = &e.thumbnail {
+            row = row.child(self.media_box(
+                format!("{key}-th"),
+                th.preview_url(),
+                (80., 80.),
+                (80., 80.),
+                Some((th.large_url(), th.url.clone())),
+                cx,
+            ));
         }
         div()
             .mt_1()
             .max_w(px(520.))
             .p_3()
-            .rounded_r(px(4.))
-            .bg(rgb(color::sidebar()))
+            .rounded_r(px(6.))
+            .bg(rgb(color::panel()))
             .border_l_4()
             .border_color(rgb(e.color.unwrap_or(color::divider())))
             .child(row)
@@ -5586,7 +6472,7 @@ impl DiscordApp {
             return self.system_row(m, time);
         }
         let group: SharedString = format!("m-{}", m.id).into();
-        let name = m.author.display_name().to_string();
+        let name = self.name_of(&m.author);
 
         let mut text = div().flex().flex_col().min_w_0().flex_1();
         if !grouped {
@@ -5618,7 +6504,7 @@ impl DiscordApp {
             text = text.child(self.rich_text(m, m.edited_timestamp.is_some(), cx));
         }
         for a in &m.attachments {
-            text = text.child(div().mt_1().child(self.attachment(a)));
+            text = text.child(div().mt_1().child(self.attachment(a, cx)));
         }
         for s in &m.sticker_items {
             let el: AnyElement = match s.url() {
@@ -5640,8 +6526,8 @@ impl DiscordApp {
             };
             text = text.child(div().mt_1().child(el));
         }
-        for e in &m.embeds {
-            text = text.child(self.embed(e));
+        for (i, e) in m.embeds.iter().enumerate() {
+            text = text.child(self.embed(e, format!("emb-{}-{i}", m.id), cx));
         }
         if !m.reactions.is_empty() {
             text = text.child(self.reactions(m, cx));

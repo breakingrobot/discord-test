@@ -172,6 +172,31 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    pub fn is_gif(&self) -> bool {
+        self.content_type.as_deref() == Some("image/gif")
+            || self.filename.to_lowercase().ends_with(".gif")
+    }
+
+    /// Size-capped rendition for the chat; GIFs keep their animation.
+    pub fn display_url(&self) -> String {
+        let base = self.proxy_url.as_deref().unwrap_or(&self.url);
+        if self.is_gif() {
+            format!("{base}?width=400&height=300")
+        } else {
+            self.preview_url()
+        }
+    }
+
+    /// Big rendition for the image viewer.
+    pub fn large_url(&self) -> String {
+        let base = self.proxy_url.as_deref().unwrap_or(&self.url);
+        if self.is_gif() {
+            base.to_string()
+        } else {
+            format!("{base}?format=png&width=1600&height=1200")
+        }
+    }
+
     pub fn is_image(&self) -> bool {
         self.content_type
             .as_deref()
@@ -190,10 +215,30 @@ pub struct EmbedMedia {
     #[serde(default)]
     pub url: String,
     #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
     pub proxy_url: Option<String>,
 }
 
 impl EmbedMedia {
+    /// Animated rendition for Tenor "gifv" embeds (their MP4 has a GIF twin).
+    pub fn tenor_gif(&self) -> Option<String> {
+        let u = &self.url;
+        (u.contains("media.tenor.com") && u.ends_with(".mp4"))
+            .then(|| u.replace("AAAPo/", "AAAAC/").replace(".mp4", ".gif"))
+    }
+
+    /// Large rendition (keeps animation: no format conversion).
+    pub fn large_url(&self) -> String {
+        let base = self.proxy_url.as_deref().unwrap_or(&self.url);
+        format!(
+            "{base}{}width=1280&height=960",
+            if base.contains('?') { "&" } else { "?" }
+        )
+    }
+
     pub fn preview_url(&self) -> String {
         let base = self.proxy_url.as_deref().unwrap_or(&self.url);
         format!("{base}?format=png&width=400&height=300")
@@ -213,6 +258,11 @@ pub struct EmbedAuthor {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Embed {
+    /// "rich", "image", "gifv", "video", "link", "article"…
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub video: Option<EmbedMedia>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -965,6 +1015,10 @@ pub struct Gif {
     pub url: String,
     /// Still image for the grid.
     pub preview: String,
+    /// Animated media (GIF) and its size, for favourites.
+    pub src: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Trending (empty query) or searched GIFs from Discord's Tenor proxy.
@@ -1002,6 +1056,13 @@ pub fn gifs(token: &str, query: &str) -> Result<Vec<Gif>, String> {
             let preview = still("preview").or_else(|| still("gif_src"))?;
             Some(Gif {
                 title: g["title"].as_str().unwrap_or("GIF").to_string(),
+                src: g["gif_src"]
+                    .as_str()
+                    .or_else(|| g["src"].as_str())
+                    .unwrap_or(&preview)
+                    .to_string(),
+                width: g["width"].as_u64().unwrap_or(0) as u32,
+                height: g["height"].as_u64().unwrap_or(0) as u32,
                 url,
                 preview,
             })
@@ -1134,4 +1195,54 @@ pub fn mentions(token: &str) -> Result<Vec<Message>, String> {
         token,
         "/users/@me/mentions?limit=25&roles=true&everyone=true",
     )
+}
+
+/// GIF categories ("Tendances", "Joyeux"…) shown before searching: (name, preview).
+pub fn gif_categories(token: &str) -> Result<Vec<(String, String)>, String> {
+    let v: Value = get(
+        token,
+        "/gifs/trending?provider=tenor&locale=fr&media_format=gif",
+    )?;
+    Ok(v["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            Some((
+                c["name"].as_str()?.to_string(),
+                c["src"].as_str()?.to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// A user settings protobuf (1 = preloaded, 2 = frecency / favourites).
+pub fn settings_proto(token: &str, kind: u8) -> Result<Vec<u8>, String> {
+    let v: Value = get(token, &format!("/users/@me/settings-proto/{kind}"))?;
+    crate::proto::decode_b64(v["settings"].as_str().unwrap_or_default())
+        .ok_or_else(|| "Paramètres illisibles".into())
+}
+
+pub fn set_settings_proto(token: &str, kind: u8, bytes: &[u8]) -> Result<(), String> {
+    send_json(
+        "PATCH",
+        token,
+        &format!("/users/@me/settings-proto/{kind}"),
+        json!({ "settings": crate::proto::encode_b64(bytes) }),
+    )?;
+    Ok(())
+}
+
+pub fn guild_stickers(token: &str, guild: &str) -> Result<Vec<Sticker>, String> {
+    get(token, &format!("/guilds/{guild}/stickers"))
+}
+
+pub fn send_sticker(token: &str, channel: &str, sticker: &str) -> Result<(), String> {
+    send_json(
+        "POST",
+        token,
+        &format!("/channels/{channel}/messages"),
+        json!({ "sticker_ids": [sticker], "nonce": nonce(), "content": "" }),
+    )?;
+    Ok(())
 }

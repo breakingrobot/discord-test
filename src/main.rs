@@ -8,6 +8,7 @@ mod emoji;
 mod gateway;
 mod notify;
 mod prefs;
+mod proto;
 mod qr;
 mod store;
 mod ui;
@@ -96,6 +97,18 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
 pub enum PickerTab {
     Emoji,
     Gif,
+    Sticker,
+}
+
+/// Full-size image viewer.
+pub struct Lightbox {
+    /// Image URL to display (large rendition).
+    pub full: String,
+    /// URL opened in the browser.
+    pub open: String,
+    pub w: f32,
+    pub h: f32,
+    pub zoom: f32,
 }
 
 pub enum Picker {
@@ -144,6 +157,18 @@ pub struct DiscordApp {
     member_roles: HashMap<String, Vec<String>>,
     presence: HashMap<String, String>,
     session_id: Option<String>,
+    folders: Vec<proto::Folder>,
+    expanded_folders: HashSet<i64>,
+    nicks: HashMap<String, String>,
+    requested_members: HashSet<(String, String)>,
+    fav_gifs: Vec<proto::FavGif>,
+    frecency_raw: Option<Vec<u8>>,
+    /// Keep the message list pinned to the newest message (until the user scrolls up).
+    pub stick: bool,
+    gif_categories: Vec<(String, String)>,
+    guild_stickers: HashMap<String, Vec<api::Sticker>>,
+    lightbox: Option<Lightbox>,
+    revealed: HashSet<String>,
     // voice
     voice: Option<voice::VoiceHandle>,
     voice_settings: voice::VoiceSettings,
@@ -294,6 +319,7 @@ impl DiscordApp {
             channel: None,
             collapsed: HashSet::new(),
             last_msg_id: None,
+            stick: true,
             show_side: prefs.show_side,
             side: Side::Members,
             search: None,
@@ -305,6 +331,16 @@ impl DiscordApp {
             member_roles: HashMap::new(),
             presence: HashMap::new(),
             session_id: None,
+            folders: vec![],
+            expanded_folders: HashSet::new(),
+            nicks: HashMap::new(),
+            requested_members: HashSet::new(),
+            fav_gifs: vec![],
+            frecency_raw: None,
+            gif_categories: vec![],
+            guild_stickers: HashMap::new(),
+            lightbox: None,
+            revealed: HashSet::new(),
             voice: None,
             voice_settings: {
                 let v = voice::VoiceSettings {
@@ -465,9 +501,12 @@ impl DiscordApp {
             self.picker = None;
             return cx.notify();
         }
-        if ks.key == "escape" && (self.profile.is_some() || self.settings) {
+        if ks.key == "escape"
+            && (self.profile.is_some() || self.settings || self.lightbox.is_some())
+        {
             self.profile = None;
             self.settings = false;
+            self.lightbox = None;
             return cx.notify();
         }
         if self.logged_in && cmd && ks.key == "f" {
@@ -659,6 +698,27 @@ impl DiscordApp {
                 }
                 "status" => self.status_menu = true,
                 "picker" => self.picker = Some(Picker::Composer),
+                "gifs" => {
+                    self.picker = Some(Picker::Composer);
+                    self.picker_tab = PickerTab::Gif;
+                    self.fav_gifs = (0..3)
+                        .map(|i| proto::FavGif {
+                            url: format!("https://tenor.com/view/demo-{i}"),
+                            src: String::new(),
+                            width: 200,
+                            height: 150,
+                            order: i,
+                        })
+                        .collect();
+                    self.gif_categories = ["Bravo", "LOL", "Merci", "Triste"]
+                        .iter()
+                        .map(|n| (n.to_string(), String::new()))
+                        .collect();
+                }
+                "stickers" => {
+                    self.picker = Some(Picker::Composer);
+                    self.picker_tab = PickerTab::Sticker;
+                }
                 "switcher" => self.switcher = Some("g".into()),
                 "reply" => self.replying = self.messages.get(1).cloned(),
                 "density" => self.density = v.to_string(),
@@ -1310,6 +1370,7 @@ impl DiscordApp {
     pub fn open_gif_tab(&mut self, cx: &mut Context<Self>) {
         self.picker_tab = PickerTab::Gif;
         self.gif_typing = true;
+        self.load_gif_categories(cx);
         if self.gifs.is_empty() {
             self.load_gifs(cx);
         }
@@ -1438,6 +1499,7 @@ impl DiscordApp {
     pub fn open_message(&mut self, m: &Message, cx: &mut Context<Self>) {
         self.inbox_open = false;
         self.jump_to = Some(m.id.clone());
+        self.stick = false;
         match &m.guild_id {
             Some(g) if self.guild.as_deref() != Some(g.as_str()) => {
                 self.pending_channel = Some(m.channel_id.clone());
@@ -1466,6 +1528,7 @@ impl DiscordApp {
     pub fn jump_to_message(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.messages.iter().any(|m| m.id == id) {
             self.jump_to = Some(id.to_string());
+            self.stick = false;
         } else {
             self.status =
                 "Ce message n'est pas chargé : utilisez « Charger les messages précédents »."
@@ -1653,6 +1716,186 @@ impl DiscordApp {
                 })
             })
             .collect()
+    }
+
+    // ---- folders / members / favourites / stickers / lightbox --------------------
+
+    /// Asks the gateway for members (roles, nicknames) of message authors we don't know yet.
+    fn request_missing_members(&mut self) {
+        let (Some(guild), Some(tx)) = (self.guild.clone(), self.gateway_cmd.clone()) else {
+            return;
+        };
+        if self.auth.starts_with("Bot ") {
+            return;
+        }
+        let mut ids: Vec<String> = Vec::new();
+        for m in &self.messages {
+            let id = &m.author.id;
+            if !self.member_roles.contains_key(id)
+                && !m.author.bot
+                && self.requested_members.insert((guild.clone(), id.clone()))
+                && !ids.contains(id)
+            {
+                ids.push(id.clone());
+            }
+        }
+        for chunk in ids.chunks(100) {
+            let _ = tx.send(gateway::Command::RequestGuildMembers {
+                guild_id: guild.clone(),
+                user_ids: chunk.to_vec(),
+            });
+        }
+    }
+
+    /// Display name in the current guild (nickname first).
+    pub fn name_of(&self, u: &User) -> String {
+        self.nicks
+            .get(&u.id)
+            .cloned()
+            .unwrap_or_else(|| u.display_name().to_string())
+    }
+
+    /// Loads favourite GIFs from the frecency settings proto (shared with the official client).
+    fn load_favorites(&mut self, cx: &mut Context<Self>) {
+        if self.auth.starts_with("Bot ") {
+            return;
+        }
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(raw) = cx
+                .background_spawn(async move { api::settings_proto(&auth, 2) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.fav_gifs = proto::favorite_gifs(&raw);
+                    this.frecency_raw = Some(raw);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn is_fav(&self, url: &str) -> bool {
+        self.fav_gifs.iter().any(|g| g.url == url)
+    }
+
+    /// Adds / removes a favourite GIF and syncs it to Discord.
+    pub fn toggle_fav(&mut self, gif: proto::FavGif, cx: &mut Context<Self>) {
+        if let Some(pos) = self.fav_gifs.iter().position(|g| g.url == gif.url) {
+            self.fav_gifs.remove(pos);
+        } else {
+            let order = self.fav_gifs.iter().map(|g| g.order).max().unwrap_or(0) + 1;
+            self.fav_gifs.insert(0, proto::FavGif { order, ..gif });
+        }
+        let raw =
+            proto::with_favorite_gifs(self.frecency_raw.as_deref().unwrap_or(&[]), &self.fav_gifs);
+        self.frecency_raw = Some(raw.clone());
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::set_settings_proto(&auth, 2, &raw) })
+                .await;
+            if let Err(e) = res {
+                this.update(cx, |this, cx| {
+                    this.status = format!("Favoris non synchronisés : {e}");
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn load_gif_categories(&mut self, cx: &mut Context<Self>) {
+        if !self.gif_categories.is_empty() {
+            return;
+        }
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(c) = cx
+                .background_spawn(async move { api::gif_categories(&auth) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.gif_categories = c;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn open_sticker_tab(&mut self, cx: &mut Context<Self>) {
+        self.picker_tab = PickerTab::Sticker;
+        self.gif_typing = false;
+        let Some(g) = self.guild.clone() else {
+            return cx.notify();
+        };
+        if self.guild_stickers.contains_key(&g) {
+            return cx.notify();
+        }
+        self.guild_stickers.insert(g.clone(), vec![]);
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let gid = g.clone();
+            if let Ok(s) = cx
+                .background_spawn(async move { api::guild_stickers(&auth, &gid) })
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.guild_stickers.insert(g, s);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn send_sticker(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        self.picker = None;
+        let auth = self.auth.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api::send_sticker(&auth, &channel.id, &id) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(e) = res {
+                    this.status = format!("Sticker impossible : {e}");
+                }
+                this.last_msg_id = None;
+                this.refresh_messages(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn open_lightbox(
+        &mut self,
+        full: String,
+        open: String,
+        w: f32,
+        h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.lightbox = Some(Lightbox {
+            full,
+            open,
+            w,
+            h,
+            zoom: 1.,
+        });
+        cx.notify();
     }
 
     pub fn open_channel_id(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -2082,6 +2325,7 @@ impl DiscordApp {
                         this.qr_stop.store(true, Ordering::Relaxed);
                         this.start_gateway(cx);
                         this.start_polling(cx);
+                        this.load_favorites(cx);
                     }
                     Err(e) => {
                         if this.autologin {
@@ -2171,6 +2415,9 @@ impl DiscordApp {
                         {
                             self.member_roles.insert(user.id.clone(), roles.clone());
                             self.users.insert(user.id.clone(), user.clone());
+                            if let Some(n) = &user.global_name {
+                                self.nicks.entry(user.id.clone()).or_insert(n.clone());
+                            }
                             self.presence
                                 .entry(user.id.clone())
                                 .or_insert_with(|| status.clone());
@@ -2190,6 +2437,19 @@ impl DiscordApp {
                 }
             }
             Session(id) => self.session_id = Some(id),
+            SettingsProto(p) => self.folders = proto::guild_folders(&p),
+            MembersChunk(list) => {
+                for (g, u, roles, nick) in list {
+                    if self.guild.as_deref() != Some(g.as_str()) {
+                        continue;
+                    }
+                    self.member_roles.insert(u.id.clone(), roles);
+                    if let Some(n) = nick {
+                        self.nicks.insert(u.id.clone(), n);
+                    }
+                    self.users.entry(u.id.clone()).or_insert(u);
+                }
+            }
             VoiceStates(list) => {
                 for (g, c, u) in list {
                     self.voice_states.insert(u, (Some(g), c, false));
@@ -2419,6 +2679,7 @@ impl DiscordApp {
         self.channel = None;
         self.messages.clear();
         self.last_msg_id = None;
+        self.stick = true;
         self.history_done = false;
         self.cancel_compose();
     }
@@ -2456,6 +2717,7 @@ impl DiscordApp {
         }
         self.messages.shrink_to_fit();
         self.roles = self.all_roles.get(&id).cloned().unwrap_or_default();
+        self.nicks.clear();
         self.member_roles.clear();
         if self.roles.is_empty() {
             self.fetch_roles(id.clone(), cx);
@@ -2598,6 +2860,7 @@ impl DiscordApp {
         self.messages = merged;
         self.status.clear();
         self.ack_current(cx);
+        self.request_missing_members();
     }
 
     // ---- images ----------------------------------------------------------
@@ -2616,8 +2879,26 @@ impl DiscordApp {
                 .flat_map(|c| &c.recipients)
                 .filter_map(|u| u.avatar_url()),
         );
+        if let Some(lb) = &self.lightbox {
+            wanted.insert(0, lb.full.clone());
+        }
         if self.picker.is_some() && self.picker_tab == PickerTab::Gif {
             wanted.extend(self.gifs.iter().map(|g| g.preview.clone()));
+            if self.gif_query.is_empty() {
+                wanted.extend(self.fav_gifs.iter().map(|g| crate::ui::fav_preview(&g.src)));
+                wanted.extend(self.gif_categories.iter().map(|(_, src)| src.clone()));
+            }
+        }
+        if self.picker.is_some() && self.picker_tab == PickerTab::Sticker {
+            if let Some(g) = &self.guild {
+                wanted.extend(
+                    self.guild_stickers
+                        .get(g)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s.url()),
+                );
+            }
         }
         if self.picker.is_some() {
             if let Some(g) = &self.guild {
@@ -2659,15 +2940,18 @@ impl DiscordApp {
                 m.attachments
                     .iter()
                     .filter(|a| a.is_image())
-                    .map(|a| a.preview_url()),
+                    .map(|a| a.display_url()),
             );
             for e in &m.embeds {
-                wanted.extend(
-                    e.image
-                        .iter()
-                        .chain(e.thumbnail.iter())
-                        .map(|i| i.preview_url()),
-                );
+                match crate::ui::embed_media(e) {
+                    Some((url, _, _)) => wanted.push(url),
+                    None => wanted.extend(
+                        e.image
+                            .iter()
+                            .chain(e.thumbnail.iter())
+                            .map(|i| i.preview_url()),
+                    ),
+                }
             }
             wanted.extend(m.reactions.iter().filter_map(|r| r.emoji.url()));
         }
