@@ -2998,14 +2998,23 @@ impl DiscordApp {
                         .flex_col()
                         .child(
                             div()
+                                .id("voice-status")
                                 .flex()
                                 .items_center()
                                 .gap_1()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(tint))
-                                .child(icon("signal", 14., tint))
-                                .child(self.voice_status.clone()),
+                                .child(div().flex_shrink_0().child(icon("signal", 14., tint)))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(self.voice_status.clone()),
+                                )
+                                .tooltip(tip(self.voice_status.clone())),
                         )
                         .child(
                             div()

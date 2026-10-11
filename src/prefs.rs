@@ -39,6 +39,11 @@ impl Default for Prefs {
     }
 }
 
+/// App data folder (%APPDATA%\\discord-gpui on Windows).
+pub fn dir() -> Option<PathBuf> {
+    path().and_then(|p| p.parent().map(PathBuf::from))
+}
+
 fn path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)

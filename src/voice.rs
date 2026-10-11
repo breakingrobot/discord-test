@@ -53,7 +53,11 @@ pub enum VoiceEvent {
     },
     /// DAVE voice privacy code once the E2EE group is established.
     Privacy(Option<String>),
-    Closed(String),
+    /// Connection ended: message and the voice gateway close code (0 if none).
+    Closed {
+        reason: String,
+        code: u16,
+    },
 }
 
 #[derive(Clone)]
@@ -117,14 +121,43 @@ pub fn connect(
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     std::thread::spawn(move || {
-        let reason = match run(&info, &settings, &events, &s) {
+        let code = AtomicU32::new(0);
+        let reason = match run(&info, &settings, &events, &s, &code) {
             Ok(()) => "Déconnecté".to_string(),
             Err(e) => e,
         };
         s.store(true, Ordering::Relaxed);
-        let _ = events.send(VoiceEvent::Closed(reason));
+        let code = code.load(Ordering::Relaxed) as u16;
+        let _ = events.send(VoiceEvent::Closed { reason, code });
     });
     VoiceHandle { stop }
+}
+
+/// Appends a line to voice.log in the app folder (no secrets), for troubleshooting.
+fn vlog(line: &str) {
+    use std::io::Write;
+    log::info!("voice: {line}");
+    let Some(path) = crate::prefs::dir().map(|d| d.join("voice.log")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    // Keep the file small: start over past 256 KB.
+    let append = std::fs::metadata(&path)
+        .map(|m| m.len() < 256 * 1024)
+        .unwrap_or(false);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&path);
+    if let Ok(mut f) = file {
+        let _ = writeln!(
+            f,
+            "{} {line}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
+        );
+    }
 }
 
 // ---- shared state --------------------------------------------------------------
@@ -217,9 +250,14 @@ fn run(
     settings: &VoiceSettings,
     events: &flume::Sender<VoiceEvent>,
     stop: &Arc<AtomicBool>,
+    close_code: &AtomicU32,
 ) -> Result<(), String> {
     let _ = events.send(VoiceEvent::State("Connexion au serveur vocal…".into()));
     let host = info.endpoint.trim_start_matches("wss://");
+    vlog(&format!(
+        "connect {host} server={} channel={} session={}",
+        info.server_id, info.channel_id, info.session_id
+    ));
     let mut ws = gateway::connect(&format!("wss://{host}/?v=8"))?;
     gateway::set_timeout(&mut ws, Duration::from_millis(50));
 
@@ -229,11 +267,9 @@ fn run(
         &mut ws,
         json!({ "op": 0, "d": {
             "server_id": info.server_id,
-            "channel_id": info.channel_id,
             "user_id": info.user_id,
             "session_id": info.session_id,
             "token": info.token,
-            "video": false,
             "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
         }}),
     )?;
@@ -318,17 +354,23 @@ fn run(
             {
                 continue
             }
-            Err(e) => return Err(format!("Connexion vocale perdue : {e}")),
+            Err(e) => {
+                vlog(&format!("socket error: {e}"));
+                return Err(format!("Connexion vocale perdue : {e}"));
+            }
         };
         match msg {
             Ws::Close(frame) => {
                 let code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
-                return Err(match code {
-                    4014 | 4022 => "Déconnecté du salon vocal".into(),
-                    4017 => "Ce salon exige le chiffrement de bout en bout (DAVE)".into(),
-                    0 => "Connexion vocale fermée".into(),
-                    c => format!("Connexion vocale fermée ({c})"),
-                });
+                close_code.store(code as u32, Ordering::Relaxed);
+                vlog(&format!(
+                    "closed {code} {}",
+                    frame
+                        .as_ref()
+                        .map(|f| f.reason.to_string())
+                        .unwrap_or_default()
+                ));
+                return Err(close_reason(code));
             }
             Ws::Binary(bytes) => {
                 if bytes.len() < 3 {
@@ -337,6 +379,7 @@ fn run(
                 seq_ack = u16::from_be_bytes([bytes[0], bytes[1]]) as i64;
                 let op = bytes[2];
                 let payload = &bytes[3..];
+                vlog(&format!("recv binary op {op} ({} bytes)", payload.len()));
                 match op {
                     // External sender package.
                     25 => {
@@ -412,6 +455,17 @@ fn run(
                     seq_ack = s;
                 }
                 let d = &v["d"];
+                if let Some(op) = v["op"].as_u64() {
+                    if !matches!(op, 5 | 6) {
+                        let mut brief = d.clone();
+                        if let Some(o) = brief.as_object_mut() {
+                            o.remove("secret_key");
+                        }
+                        let mut s = brief.to_string();
+                        s.truncate(300);
+                        vlog(&format!("recv op {op} {s}"));
+                    }
+                }
                 match v["op"].as_u64() {
                     // Hello
                     Some(8) => {
@@ -543,6 +597,27 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// French message for a voice gateway close code.
+pub fn close_reason(code: u16) -> String {
+    match code {
+        4004 => "Authentification vocale refusée (4004)".into(),
+        4006 => "Session vocale expirée (4006)".into(),
+        4009 => "Délai de session vocale dépassé (4009)".into(),
+        4011 | 4015 => format!("Serveur vocal indisponible ({code})"),
+        4014 | 4022 => "Déconnecté du salon vocal".into(),
+        4016 => "Mode de chiffrement refusé (4016)".into(),
+        4017 => "Ce salon exige le chiffrement de bout en bout (DAVE)".into(),
+        4021 => "Trop de tentatives, réessaie dans un instant".into(),
+        0 => "Connexion vocale fermée".into(),
+        c => format!("Connexion vocale fermée ({c})"),
+    }
+}
+
+/// Close codes after which a fresh voice session (new token) usually works.
+pub fn retryable(code: u16) -> bool {
+    matches!(code, 0 | 4006 | 4009 | 4011 | 4015 | 4020)
 }
 
 /// Sends the 74-byte discovery request and parses our public address.

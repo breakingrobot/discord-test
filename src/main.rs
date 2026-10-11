@@ -173,6 +173,9 @@ pub struct DiscordApp {
     voice: Option<voice::VoiceHandle>,
     voice_settings: voice::VoiceSettings,
     voice_target: Option<(Option<String>, String)>,
+    /// Bumped on every voice connection so events from an old one are ignored.
+    voice_gen: u64,
+    voice_retries: u32,
     voice_session: Option<String>,
     voice_server: Option<(String, String)>,
     voice_connected: bool,
@@ -354,6 +357,8 @@ impl DiscordApp {
             },
             voice_target: None,
             voice_session: None,
+            voice_gen: 0,
+            voice_retries: 0,
             voice_server: None,
             voice_connected: false,
             voice_status: String::new(),
@@ -1560,6 +1565,8 @@ impl DiscordApp {
         self.speaking.clear();
         self.voice_target = Some((guild.clone(), channel.clone()));
         self.voice_status = "Connexion…".into();
+        self.voice_retries = 0;
+        self.voice_gen += 1;
         if let Some(tx) = &self.gateway_cmd {
             let _ = tx.send(gateway::Command::VoiceState {
                 guild_id: guild,
@@ -1649,14 +1656,65 @@ impl DiscordApp {
             channel_id: channel,
             user_id: me.id,
         };
+        // The token is single use: never reconnect with it again.
+        self.voice_server = None;
         let (tx, rx) = flume::unbounded();
+        self.voice_gen += 1;
+        let gen = self.voice_gen;
         self.voice = Some(voice::connect(info, self.voice_settings.clone(), tx));
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv_async().await {
-                if this.update(cx, |this, cx| this.on_voice(ev, cx)).is_err() {
+                let alive = this.update(cx, |this, cx| {
+                    // A replaced connection must not touch the current one.
+                    if this.voice_gen == gen {
+                        this.on_voice(ev, cx);
+                    }
+                });
+                if alive.is_err() {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Discord voice tokens are single use: rejoin to get a fresh session and server.
+    fn retry_voice(&mut self, cx: &mut Context<Self>) {
+        let (Some((guild, channel)), Some(tx)) =
+            (self.voice_target.clone(), self.gateway_cmd.clone())
+        else {
+            return;
+        };
+        self.voice_retries += 1;
+        self.voice_gen += 1;
+        self.voice = None;
+        self.voice_server = None;
+        self.voice_session = None;
+        self.voice_status = format!("Reconnexion au vocal… ({}/3)", self.voice_retries);
+        let _ = tx.send(gateway::Command::VoiceState {
+            guild_id: guild.clone(),
+            channel_id: None,
+            mute: false,
+            deaf: false,
+        });
+        let (mute, deaf) = (
+            self.voice_settings.muted.load(Ordering::Relaxed),
+            self.voice_settings.deafened.load(Ordering::Relaxed),
+        );
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.voice_target.as_ref().map(|(_, c)| c) == Some(&channel) {
+                    let _ = tx.send(gateway::Command::VoiceState {
+                        guild_id: guild,
+                        channel_id: Some(channel),
+                        mute,
+                        deaf,
+                    });
+                }
+            });
         })
         .detach();
     }
@@ -1667,6 +1725,7 @@ impl DiscordApp {
             State(s) => self.voice_status = s,
             Connected => {
                 self.voice_connected = true;
+                self.voice_retries = 0;
                 self.voice_status = "Voix connectée".into();
             }
             Speaking { user_id, speaking } => {
@@ -1682,13 +1741,18 @@ impl DiscordApp {
                 }
             }
             Privacy(code) => self.voice_privacy = code,
-            Closed(reason) => {
-                if self.voice_target.is_some() {
-                    self.voice_status = reason;
-                }
+            Closed { reason, code } => {
+                log::warn!("voice closed: {reason} (code {code})");
                 self.voice = None;
                 self.voice_connected = false;
                 self.speaking.clear();
+                if self.voice_target.is_some() {
+                    if voice::retryable(code) && self.voice_retries < 3 {
+                        self.retry_voice(cx);
+                    } else {
+                        self.voice_status = reason;
+                    }
+                }
             }
         }
         cx.notify();
@@ -2436,7 +2500,17 @@ impl DiscordApp {
                     }
                 }
             }
-            Session(id) => self.session_id = Some(id),
+            Session(id) => {
+                // A brand new gateway session invalidates the voice one: rejoin.
+                let changed = self.session_id.as_ref().is_some_and(|old| *old != id);
+                self.session_id = Some(id);
+                if changed && self.voice_target.is_some() {
+                    self.voice = None;
+                    self.voice_connected = false;
+                    self.voice_retries = 0;
+                    self.retry_voice(cx);
+                }
+            }
             SettingsProto(p) => self.folders = proto::guild_folders(&p),
             MembersChunk(list) => {
                 for (g, u, roles, nick) in list {
@@ -2467,7 +2541,16 @@ impl DiscordApp {
                 if let Some(u) = user {
                     self.users.insert(u.id.clone(), u);
                 }
-                let mine = self.me.as_ref().is_some_and(|m| m.id == user_id);
+                let me = self.me.as_ref().is_some_and(|m| m.id == user_id);
+                // Our own account may also be in voice from another device.
+                let mine = me && self.session_id.as_ref().is_none_or(|s| *s == session_id);
+                if me && !mine && channel_id.is_some() && self.voice_target.is_some() {
+                    self.voice_target = None;
+                    self.voice = None;
+                    self.voice_connected = false;
+                    self.speaking.clear();
+                    self.voice_status = "Vocal repris sur un autre appareil".into();
+                }
                 match channel_id {
                     Some(c) => {
                         self.voice_states.insert(user_id, (guild_id, c, mute));
@@ -2478,7 +2561,11 @@ impl DiscordApp {
                     }
                     None => {
                         self.voice_states.remove(&user_id);
-                        if mine && self.voice_target.is_some() && self.voice_connected {
+                        if mine
+                            && self.voice_target.is_some()
+                            && self.voice_connected
+                            && self.voice_retries == 0
+                        {
                             // Kicked / moved out of the channel.
                             self.voice_target = None;
                             self.voice = None;
